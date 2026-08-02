@@ -12,7 +12,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from sparkrun.utils.text import substitute_placeholders
+from sparkrun.utils.text import render_template
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +89,7 @@ def render_hook_command(cmd: str, context: dict[str, str]) -> str:
     Returns:
         Rendered command string.
     """
-    rendered = cmd
-    last = None
-    while last != rendered:
-        last = rendered
-        rendered = substitute_placeholders(rendered, context)
-    return rendered
+    return render_template(cmd, context)
 
 
 def render_hook_commands(

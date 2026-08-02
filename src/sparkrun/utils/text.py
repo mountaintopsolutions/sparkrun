@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Upper bound on substitution passes.  Legitimate nesting is a short chain
+# (``base_url`` -> ``port``); anything deeper than this is a cycle.
+_MAX_SUBSTITUTION_PASSES = 10
 
 # Placeholder scanner for command templates.  The alternation order matters:
 # a ``{{``/``}}`` brace escape is consumed *before* the placeholder branch can
@@ -53,6 +60,41 @@ def substitute_placeholders(text: str, values: Any) -> str:
         return match.group(0) if value is None else str(value)
 
     return _PLACEHOLDER_RE.sub(_replace, text)
+
+
+def render_template(text: str, values: Any, *, max_passes: int = _MAX_SUBSTITUTION_PASSES) -> str:
+    """Substitute placeholders repeatedly until the text stops changing.
+
+    Iterating is what makes nested references work — a default of
+    ``http://localhost:{port}`` needs a second pass to resolve ``{port}`` once
+    ``{base_url}`` has been pulled in.
+
+    The iteration is bounded.  An unbounded fixpoint loop never terminates for
+    a self-growing value (``a: "x{a}"`` renders ``x{a}`` -> ``xx{a}`` -> ... ),
+    turning a malformed recipe into a hang with no output.  On hitting the
+    bound we log and return the last result, so the failure surfaces as a bad
+    command rather than a wedged process.  A value that resolves to itself
+    (``a: "{a}"``) is a fixpoint on the first pass and never reaches this.
+
+    Args:
+        text: Template string.
+        values: Anything with a one-argument ``.get(key)``.
+        max_passes: Substitution passes before giving up.
+
+    Returns:
+        The rendered string.
+    """
+    for _ in range(max_passes):
+        rendered = substitute_placeholders(text, values)
+        if rendered == text:
+            return rendered
+        text = rendered
+
+    logger.warning(
+        "Template did not stabilize after %d substitution passes — check for a placeholder whose value contains itself; using the last result",
+        max_passes,
+    )
+    return text
 
 
 def coerce_value(value: str):

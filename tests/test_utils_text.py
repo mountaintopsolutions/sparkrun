@@ -9,9 +9,11 @@ inner brace.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
-from sparkrun.utils.text import substitute_placeholders
+from sparkrun.utils.text import render_template, substitute_placeholders
 
 
 class TestBasicSubstitution:
@@ -184,6 +186,53 @@ class TestJsonValuedArgs:
         text = '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
 
         assert substitute_placeholders(text, {"port": 8000}) == text
+
+
+class TestRenderTemplate:
+    """The bounded fixpoint loop around ``substitute_placeholders``."""
+
+    def test_resolves_nested_reference(self):
+        """A value containing a placeholder is resolved by a later pass."""
+        assert render_template("{base_url}", {"base_url": "http://h:{port}", "port": 8000}) == "http://h:8000"
+
+    def test_resolves_deep_chain(self):
+        """Chained references resolve however deep, within the bound."""
+        assert render_template("{a}", {"a": "{b}", "b": "{c}", "c": "end"}) == "end"
+
+    def test_self_resolving_value_is_a_fixpoint(self):
+        """``a: "{a}"`` stabilizes on the first pass — not a cycle."""
+        assert render_template("{a}", {"a": "{a}"}) == "{a}"
+
+    def test_self_growing_value_terminates(self, caplog):
+        """``a: "x{a}"`` grows every pass; the loop must stop and say so.
+
+        Without the bound this never reaches a fixpoint and the render hangs
+        while the string grows without limit.
+        """
+        with caplog.at_level(logging.WARNING, logger="sparkrun.utils.text"):
+            rendered = render_template("{a}", {"a": "x{a}"})
+
+        assert rendered == "x" * 10 + "{a}"
+        assert "did not stabilize" in caplog.text
+
+    def test_mutual_recursion_terminates(self, caplog):
+        """Two values referencing each other also hit the bound rather than hang."""
+        with caplog.at_level(logging.WARNING, logger="sparkrun.utils.text"):
+            rendered = render_template("{a}", {"a": "1{b}", "b": "2{a}"})
+
+        assert rendered.endswith("{a}") or rendered.endswith("{b}")
+        assert "did not stabilize" in caplog.text
+
+    def test_max_passes_is_configurable(self):
+        """The bound is a keyword argument, not a hard-coded constant."""
+        assert render_template("{a}", {"a": "x{a}"}, max_passes=3) == "xxx{a}"
+
+    def test_no_warning_for_ordinary_templates(self, caplog):
+        """A template that stabilizes logs nothing."""
+        with caplog.at_level(logging.WARNING, logger="sparkrun.utils.text"):
+            render_template("--port {port}", {"port": 8000})
+
+        assert caplog.text == ""
 
 
 class TestShellIdioms:

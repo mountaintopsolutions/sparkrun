@@ -16,7 +16,7 @@ from vpd.next.util import read_yaml
 from scitrera_app_framework.api import Variables, EnvPlacement
 
 from sparkrun.core.layout import RecipeLayout
-from sparkrun.utils.text import substitute_placeholders
+from sparkrun.utils.text import render_template, substitute_placeholders
 
 if TYPE_CHECKING:
     from sparkrun.core.registry import RegistryManager
@@ -1009,14 +1009,11 @@ class Recipe:
 
         rendered = self.command.strip()
 
-        # Substitute {placeholder} tokens; iterate to handle nested references
+        # Substitute {placeholder} tokens, iterating to handle nested references
         # (e.g. a default of ``http://localhost:{port}``).  The substituter is
         # brace-escape aware, so a placeholder nested inside ``{{...}}`` JSON
         # still renders (issue: --speculative-config passed through verbatim).
-        last = None
-        while last != rendered:
-            last = rendered
-            rendered = substitute_placeholders(rendered, config_chain)
+        rendered = render_template(rendered, config_chain)
 
         # v1 (eugr) recipes escape literal braces as '{{'/'}}' so they survive
         # the {placeholder} substitution above (e.g. JSON-valued flags like
