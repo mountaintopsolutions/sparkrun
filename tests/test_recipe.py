@@ -482,6 +482,40 @@ def test_render_command_collapses_v1_brace_escapes():
     assert "--port 8000" in rendered
 
 
+def test_render_command_substitutes_placeholder_nested_in_brace_escape():
+    """A ``{placeholder}`` inside ``{{...}}``-escaped JSON is rendered.
+
+    ``@eugr/inkling-small-nvfp4`` writes its speculative-decoding flag as
+    escaped JSON with a placeholder inside.  vpd's ``arg_substitute`` matched
+    greedily from the opening ``{{`` through the placeholder's closing brace,
+    failed the lookup on that whole span and restored it verbatim — so vLLM
+    received a literal ``{num_speculative_tokens}`` and rejected the value::
+
+        vllm serve: error: argument --speculative-config/-sc: Value
+        {"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}
+        cannot be converted to <function loads ...>
+
+    and the head node never became ready.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-spec-decode",
+            "model": "eugr/inkling-small-nvfp4",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"port": 8000, "num_speculative_tokens": 1},
+            "command": (
+                'vllm serve m --port {port} --speculative-config \'{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}\''
+            ),
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "{num_speculative_tokens}" not in rendered
+    assert '--speculative-config \'{"method":"mtp","num_speculative_tokens":1}\'' in rendered
+    assert "--port 8000" in rendered
+
+
 def test_render_command_does_not_collapse_braces_for_v2():
     """v2 recipes are unaffected by the v1 brace-escape collapse."""
     recipe = Recipe.from_dict(

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from sparkrun.utils.env import merge_env, resolve_ssh_user, suppress_noisy_loggers
 from sparkrun.utils.net import get_local_ips, is_local_host, is_valid_ip
-from sparkrun.utils.text import coerce_value, format_duration, parse_kv_output, parse_scoped_name
+from sparkrun.utils.text import coerce_value, format_duration, parse_kv_output, parse_scoped_name, substitute_placeholders
 from sparkrun.utils.yaml_helpers import load_yaml
 
 __all__ = [
@@ -24,5 +24,6 @@ __all__ = [
     "parse_kv_output",
     "parse_scoped_name",
     "resolve_ssh_user",
+    "substitute_placeholders",
     "suppress_noisy_loggers",
 ]

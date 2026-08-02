@@ -2,6 +2,58 @@
 
 from __future__ import annotations
 
+import re
+from typing import Any
+
+# Placeholder scanner for command templates.  The alternation order matters:
+# a ``{{``/``}}`` brace escape is consumed *before* the placeholder branch can
+# see the inner brace, so an escape never becomes the opening brace of a
+# placeholder (and vice versa).
+_PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{([^{}]*)\}")
+
+
+def substitute_placeholders(text: str, values: Any) -> str:
+    """Substitute ``{key}`` placeholders from ``values`` in a single pass.
+
+    Replaces vpd's ``arg_substitute``, whose ``\\{(.*?)\\}`` regex is blind to
+    ``{{``/``}}`` brace escapes: given a placeholder nested inside escaped JSON
+    braces it matched from the *escape* through the placeholder's closing brace,
+    treated that whole span as one variable name, failed the lookup and restored
+    it verbatim — silently swallowing the real placeholder.  A recipe line like::
+
+        --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
+
+    therefore reached the runtime with ``{num_speculative_tokens}`` unrendered.
+    Standalone placeholders (``{host}``, ``{port}``) were unaffected, which is
+    why the failure only showed up on JSON-valued flags.
+
+    Scanning left to right, each match is one of:
+
+    - ``{{`` or ``}}`` — a brace escape, emitted verbatim.  Collapsing to a
+      single brace is a separate, caller-controlled step (see
+      ``recipe._collapse_brace_escapes``), so escaping survives the round trip.
+    - ``{key}`` — substituted with ``str(values.get(key))``.  An unknown key (or
+      one resolving to ``None``) is restored verbatim, matching the documented
+      "unresolved placeholders are left as-is" behavior.
+
+    Args:
+        text: Template string.
+        values: Anything with a one-argument ``.get(key)`` — a ``dict`` or a SAF
+            ``Variables`` config chain.
+
+    Returns:
+        The rendered string.
+    """
+
+    def _replace(match: re.Match) -> str:
+        key = match.group(1)
+        if key is None:  # a {{ or }} brace escape, not a placeholder
+            return match.group(0)
+        value = values.get(key)
+        return match.group(0) if value is None else str(value)
+
+    return _PLACEHOLDER_RE.sub(_replace, text)
+
 
 def coerce_value(value: str):
     """Coerce a string value to int, float, or bool where possible."""

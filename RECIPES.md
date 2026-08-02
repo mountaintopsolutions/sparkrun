@@ -228,6 +228,17 @@ command: |
 
 - Unresolved placeholders are left as-is
 - Trailing spaces after backslash continuations (`\ \n`) are auto-fixed
+- JSON-valued flags work with plain braces — `{` that isn't a `{key}` placeholder is left alone, and a placeholder
+  nested inside JSON still renders:
+
+  ```yaml
+  command: |
+    vllm serve {model} \
+        --speculative-config '{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}'
+  ```
+
+  v1 (eugr) recipes may instead double their braces (`'{{"method":"mtp"}}'`); the escapes are collapsed back to
+  single braces after substitution
 - The runtime may auto-append flags (e.g. `--served-model-name`) if the template omits them
 
 **When to use templates:** full control over flags, ordering, runtime-specific features not in the flag map. **When to

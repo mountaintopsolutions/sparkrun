@@ -12,7 +12,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from vpd.legacy.arguments import arg_substitute
+from sparkrun.utils.text import substitute_placeholders
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ def build_hook_context(
 def render_hook_command(cmd: str, context: dict[str, str]) -> str:
     """Render ``{key}`` placeholders in a hook command string.
 
-    Uses the same ``arg_substitute`` used for recipe command rendering.
+    Uses the same brace-escape-aware substituter as recipe command rendering.
 
     Args:
         cmd: Command string with ``{key}`` placeholders.
@@ -93,7 +93,7 @@ def render_hook_command(cmd: str, context: dict[str, str]) -> str:
     last = None
     while last != rendered:
         last = rendered
-        rendered = arg_substitute(rendered, context)
+        rendered = substitute_placeholders(rendered, context)
     return rendered
 
 

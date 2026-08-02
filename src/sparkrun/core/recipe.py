@@ -13,10 +13,10 @@ from typing import Any, TYPE_CHECKING, Optional
 import yaml
 
 from vpd.next.util import read_yaml
-from vpd.legacy.arguments import arg_substitute
 from scitrera_app_framework.api import Variables, EnvPlacement
 
 from sparkrun.core.layout import RecipeLayout
+from sparkrun.utils.text import substitute_placeholders
 
 if TYPE_CHECKING:
     from sparkrun.core.registry import RegistryManager
@@ -196,11 +196,11 @@ class DistributionConfig:
 
         for entry in self.models.entries:
             if isinstance(entry, DistributionModelEntry):
-                entry.name = arg_substitute(entry.name, config_chain)
+                entry.name = substitute_placeholders(entry.name, config_chain)
 
         for entry in self.containers.entries:
             if isinstance(entry, DistributionContainerEntry):
-                entry.name = arg_substitute(entry.name, config_chain)
+                entry.name = substitute_placeholders(entry.name, config_chain)
 
         return self
 
@@ -1009,12 +1009,14 @@ class Recipe:
 
         rendered = self.command.strip()
 
-        # Use vpd arg_substitute for {placeholder} replacement
-        # Iterate to handle nested substitutions
+        # Substitute {placeholder} tokens; iterate to handle nested references
+        # (e.g. a default of ``http://localhost:{port}``).  The substituter is
+        # brace-escape aware, so a placeholder nested inside ``{{...}}`` JSON
+        # still renders (issue: --speculative-config passed through verbatim).
         last = None
         while last != rendered:
             last = rendered
-            rendered = arg_substitute(rendered, config_chain)
+            rendered = substitute_placeholders(rendered, config_chain)
 
         # v1 (eugr) recipes escape literal braces as '{{'/'}}' so they survive
         # the {placeholder} substitution above (e.g. JSON-valued flags like
