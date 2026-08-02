@@ -531,6 +531,101 @@ def test_render_command_does_not_collapse_braces_for_v2():
     assert "{{literal}}" in rendered
 
 
+def _render(command: str, defaults: dict[str, Any] | None = None, version: str = "2", overrides: dict[str, Any] | None = None) -> str:
+    """Build a throwaway recipe and render its command template."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "t",
+            "model": "m",
+            "runtime": "vllm",
+            "recipe_version": version,
+            "defaults": defaults or {},
+            "command": command,
+        }
+    )
+    return recipe.render_command(recipe.build_config_chain(overrides or {}))
+
+
+class TestRenderCommandJsonArgs:
+    """JSON-valued flags end-to-end, across both recipe format versions.
+
+    ``render_command`` = substitute to a fixpoint, then (v1 only) collapse
+    ``{{``/``}}``.  These pin the interaction between those two steps, which is
+    where JSON-valued flags live or die.
+    """
+
+    def test_v1_escaped_json_with_placeholder(self):
+        """The eugr spelling: escaped braces with a placeholder inside."""
+        rendered = _render(
+            'x --speculative-config \'{{"method":"mtp","num_speculative_tokens":{n}}}\'',
+            {"n": 1},
+            version="1",
+        )
+
+        assert rendered == 'x --speculative-config \'{"method":"mtp","num_speculative_tokens":1}\''
+
+    def test_v1_escaped_nested_json(self):
+        """Nested escaped JSON collapses to valid JSON, not a truncated brace run."""
+        rendered = _render('x --c \'{{"a":{{"b":{n}}}}}\'', {"n": 1}, version="1")
+
+        assert rendered == 'x --c \'{"a":{"b":1}}\''
+
+    def test_v2_bare_json_with_placeholder(self):
+        """v2 recipes need no escaping — plain JSON with a placeholder works."""
+        rendered = _render('x --c \'{"a":{"b":{n}}}\'', {"n": 1})
+
+        assert rendered == 'x --c \'{"a":{"b":1}}\''
+
+    def test_json_arg_is_overridable_per_field(self):
+        """A placeholder inside JSON stays reachable from ``-o key=value``.
+
+        The alternative fix — folding the whole blob into one default — renders
+        correctly but gives up per-field overrides.
+        """
+        rendered = _render(
+            'x --speculative-config \'{{"method":"mtp","num_speculative_tokens":{n}}}\'',
+            {"n": 1},
+            version="1",
+            overrides={"n": 8},
+        )
+
+        assert '"num_speculative_tokens":8' in rendered
+
+    def test_json_arg_without_placeholder_still_collapses(self):
+        """The no-placeholder case (issue #213) is unchanged."""
+        rendered = _render("x --diffusion-config '{{\"canvas_length\": 256}}'", version="1")
+
+        assert rendered == "x --diffusion-config '{\"canvas_length\": 256}'"
+
+
+class TestRenderCommandNesting:
+    """Substitution iterates to a fixpoint, so values may reference values."""
+
+    def test_value_referencing_another_key(self):
+        """The documented nested case: ``base_url: http://localhost:{port}``."""
+        rendered = _render("x --url {base_url}", {"port": 8000, "base_url": "http://localhost:{port}"})
+
+        assert rendered == "x --url http://localhost:8000"
+
+    def test_multi_level_nesting(self):
+        """Chained references resolve however deep they go."""
+        assert _render("x {a}", {"a": "{b}", "b": "{c}", "c": "deep"}) == "x deep"
+
+    def test_substituted_json_value_is_not_re_substituted(self):
+        """A JSON blob pulled in from a default passes through the next pass.
+
+        This is the shape PR eugr/spark-vllm-docker#324 adopts recipe-side; it
+        must keep working now that the renderer handles JSON directly.
+        """
+        rendered = _render("x --c '{spec}'", {"spec": '{"method":"mtp","num_speculative_tokens":2}'})
+
+        assert rendered == 'x --c \'{"method":"mtp","num_speculative_tokens":2}\''
+
+    def test_unresolved_placeholder_survives_all_passes(self):
+        """An unknown key never becomes an empty string."""
+        assert _render("x {unknown}", {"port": 8000}) == "x {unknown}"
+
+
 def test_render_command_fixes_trailing_space_continuations():
     """Trailing spaces after backslash line-continuations are stripped.
 
