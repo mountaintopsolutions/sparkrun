@@ -11,6 +11,7 @@ from sparkrun.core.scheduler import NEW_CLUSTER_DEFAULT_SCHEDULER, new_cluster_s
 
 from ._common import (
     CLUSTER_NAME,
+    INIT_NETWORK,
     TARGET,
     _get_cluster_manager,
     _get_context,
@@ -89,6 +90,14 @@ def cluster(ctx):
     help="Executor option (repeatable): -o key=value (e.g. -o privileged=false -o shm_size=16g)",
 )
 @click.option(
+    "--init-network",
+    "init_network",
+    default=None,
+    type=INIT_NETWORK,
+    help="Network multi-node distributed init rendezvouses on: 'auto' (management first, CX7/IB fallback), "
+    "'fabric' (prefer CX7/IB so MASTER_ADDR/NODE_IP ride the fast link), or 'management'.",
+)
+@click.option(
     "--scheduler",
     "scheduler_name",
     default=NEW_CLUSTER_DEFAULT_SCHEDULER,
@@ -118,6 +127,7 @@ def cluster_create(
     transfer_interface,
     executor_name,
     executor_opts,
+    init_network,
     scheduler_name,
     max_gpu_mem_util,
     set_default,
@@ -157,6 +167,7 @@ def cluster_create(
             transfer_interface=transfer_interface,
             executor=executor_name,
             executor_config=executor_config,
+            init_network=init_network,
             scheduler=scheduler_name,
             max_gpu_memory_utilization=max_gpu_mem_util,
         )
@@ -380,6 +391,13 @@ cluster_import.add_command(cluster_import_svd, "eugr")
     help="Remove all executor config options from the cluster",
 )
 @click.option(
+    "--init-network",
+    "init_network",
+    default=None,
+    type=INIT_NETWORK,
+    help="Network multi-node distributed init rendezvouses on (auto, fabric, management). Pass empty string to clear.",
+)
+@click.option(
     "--scheduler",
     "scheduler_name",
     default=None,
@@ -411,6 +429,7 @@ def cluster_update(
     executor_name,
     executor_opts,
     clear_executor_config,
+    init_network,
     scheduler_name,
     max_gpu_mem_util,
 ):
@@ -451,6 +470,7 @@ def cluster_update(
     topology_provided = ctx.get_parameter_source("topology") == ParameterSource.COMMANDLINE
     executor_provided = ctx.get_parameter_source("executor_name") == ParameterSource.COMMANDLINE
     executor_opts_provided = bool(executor_opts) or clear_executor_config
+    init_network_provided = ctx.get_parameter_source("init_network") == ParameterSource.COMMANDLINE
     scheduler_provided = ctx.get_parameter_source("scheduler_name") == ParameterSource.COMMANDLINE
     max_gpu_mem_util_provided = ctx.get_parameter_source("max_gpu_mem_util") == ParameterSource.COMMANDLINE
 
@@ -466,6 +486,7 @@ def cluster_update(
         and not infer_hardware
         and not executor_provided
         and not executor_opts_provided
+        and not init_network_provided
         and not scheduler_provided
         and not max_gpu_mem_util_provided
     ):
@@ -473,7 +494,8 @@ def cluster_update(
             "Error: Nothing to update. Provide --hosts, --hosts-file, --add-host, "
             "--remove-host, -d, --user, --cache-dir, --transfer-mode, "
             "--transfer-interface, --topology, --infer-hardware, --executor, "
-            "--executor-opt, --clear-executor-config, --scheduler, or --max-gpu-mem-util.",
+            "--executor-opt, --clear-executor-config, --init-network, --scheduler, or "
+            "--max-gpu-mem-util.",
             err=True,
         )
         sys.exit(1)
@@ -543,6 +565,9 @@ def cluster_update(
         update_kwargs["executor_config"] = None
     elif executor_opts:
         update_kwargs["executor_config"] = _parse_executor_opts(executor_opts)
+    if init_network_provided:
+        # Empty string clears the preference (back to the config/auto default)
+        update_kwargs["init_network"] = init_network if init_network else None
     if scheduler_provided:
         # Empty string clears the scheduler selector
         update_kwargs["scheduler"] = scheduler_name if scheduler_name else None
@@ -681,6 +706,8 @@ def cluster_show(ctx, name, output_json):
         click.echo("Executor config:")
         for k, v in sorted(c.executor_config.items()):
             click.echo(f"  {k}: {v}")
+    if c.init_network:
+        click.echo(f"Init net:    {c.init_network}")
     if c.scheduler:
         click.echo(f"Scheduler:   {c.scheduler}")
     click.echo(f"Default:     {'yes' if c.name == default_name else 'no'}")

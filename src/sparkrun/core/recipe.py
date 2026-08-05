@@ -16,6 +16,7 @@ from vpd.next.util import read_yaml
 from vpd.legacy.arguments import arg_substitute
 from scitrera_app_framework.api import Variables, EnvPlacement
 
+from sparkrun.core.init_network import InitNetworkError, normalize_init_network
 from sparkrun.core.layout import RecipeLayout
 
 if TYPE_CHECKING:
@@ -66,6 +67,7 @@ _KNOWN_KEYS = {
     "builder_config",
     "executor",
     "executor_config",
+    "init_network",
     "scheduler",
     "distribution_config",
     "layout",
@@ -885,6 +887,16 @@ class Recipe:
         # No CLI surface; recipe-only.
         self.executor: str = str(data.get("executor", "") or "")
 
+        # Which network multi-node distributed init rendezvouses on:
+        # ``""``/``"auto"`` (default) keeps the management-first-with-fabric-
+        # fallback behavior, ``"fabric"`` prefers the CX7/IB addresses, and
+        # ``"management"`` pins the management network.  Normalized eagerly so
+        # a typo fails at load time rather than mid-launch.
+        try:
+            self.init_network: str = normalize_init_network(data.get("init_network")) or ""
+        except InitNetworkError as e:
+            raise RecipeError("Invalid recipe %r: %s" % (self.name, e)) from e
+
         # Optional scheduler selector.  ``""`` (default) → GreedyScheduler.
         # ``"occupancy-sparse"`` / ``"occupancy-dense"`` opt in to
         # occupancy-sparse / occupancy-dense placement + fractional GPU sharing.
@@ -1390,6 +1402,7 @@ class Recipe:
             "builder_config": dict(self.builder_config),
             "executor": self.executor,
             "executor_config": dict(self.executor_config),
+            "init_network": self.init_network,
             "scheduler": self.scheduler,
             "distribution_config": dataclass_asdict(self.distribution_config),
             "layout": self.layout.to_dict() if self.layout else None,
@@ -1432,6 +1445,7 @@ class Recipe:
         self.builder_config = dict(state.get("builder_config") or {})
         self.executor = str(state.get("executor", "") or "")
         self.executor_config = dict(state.get("executor_config") or {})
+        self.init_network = normalize_init_network(state.get("init_network")) or ""
         self.scheduler = str(state.get("scheduler", "") or "")
         self._applied_overrides = dict(state.get("_applied_overrides") or {})
         dist_cfg: dict | None = state.get("distribution_config", None)
@@ -1483,6 +1497,9 @@ class Recipe:
         "container",
         "solo_only",
         "cluster_only",
+        "executor",
+        "executor_config",
+        "init_network",
         "layout",
         "cluster_config",
         "metadata",
@@ -1571,6 +1588,19 @@ class Recipe:
             d["builder"] = self.builder
         if self.builder_config:
             d["builder_config"] = dict(self.builder_config)
+
+        # -- Executor (selector + container options: shm_size, ulimit, …) --
+        # Part of the recipe's launch contract, so an exported recipe must
+        # reproduce it; omitting these silently downgraded a workload's
+        # container settings to the executor defaults on re-import.
+        if self.executor:
+            d["executor"] = self.executor
+        if self.executor_config:
+            d["executor_config"] = dict(self.executor_config)
+
+        # -- Distributed-init network preference --
+        if self.init_network:
+            d["init_network"] = self.init_network
 
         # -- Scheduler --
         if self.scheduler:

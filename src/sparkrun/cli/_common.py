@@ -961,6 +961,38 @@ class RuntimeNameType(click.ParamType):
 RUNTIME_NAME = RuntimeNameType()
 
 
+class InitNetworkType(click.ParamType):
+    """Click parameter type for ``--init-network``.
+
+    A plain :class:`click.Choice` would reject the aliases the recipe / cluster
+    YAML accept (``ib`` / ``cx7`` / ``infiniband`` → ``fabric``, ``mgmt`` →
+    ``management``), so the CLI and the file formats would disagree about what
+    is a valid value.  This normalizes through the one canonical resolver and
+    completes on the canonical names only.
+
+    An empty string normalizes to ``None`` — the spelling ``cluster update``
+    uses to clear a stored preference.
+    """
+
+    name = "init_network"
+
+    def convert(self, value, param, ctx):
+        from sparkrun.core.init_network import InitNetworkError, normalize_init_network
+
+        try:
+            return normalize_init_network(value)
+        except InitNetworkError as e:
+            self.fail(str(e), param, ctx)
+
+    def shell_complete(self, ctx, param, incomplete):
+        from sparkrun.core.init_network import INIT_NETWORK_CHOICES
+
+        return [click.shell_completion.CompletionItem(c) for c in INIT_NETWORK_CHOICES if c.startswith(incomplete)]
+
+
+INIT_NETWORK = InitNetworkType()
+
+
 def host_options(f):
     """Common host-targeting options: --hosts, --hosts-file, --cluster."""
     f = click.option("--cluster", "cluster_name", default=None, type=CLUSTER_NAME, help="Use a saved cluster by name")(f)

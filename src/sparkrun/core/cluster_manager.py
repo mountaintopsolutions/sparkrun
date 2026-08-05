@@ -11,6 +11,7 @@ from typing import Any, TYPE_CHECKING
 import yaml
 
 from sparkrun.core.hardware import HostHardware, default_dgx_spark_hardware
+from sparkrun.core.init_network import normalize_init_network
 
 if TYPE_CHECKING:
     from sparkrun.core.cluster_status import ClusterStatus
@@ -196,6 +197,19 @@ class ClusterDefinition:
     cluster express "every workload here gets these baseline executor
     settings" while still letting recipes/CLI tighten things.
     """
+    init_network: str | None = None
+    """Which network multi-node distributed init rendezvouses on.
+
+    ``None`` / ``"auto"`` (default) keeps the historical management-first
+    behavior, substituting the CX7/IB fabric only when a worker can't reach the
+    management head address.  ``"fabric"`` prefers the fabric, so
+    ``MASTER_ADDR`` / ``NODE_IP`` / the socket-interface env ride the same link
+    the collective does — the natural setting for a cluster whose hosts are
+    SSH'd on a slow management LAN but wired together over CX7.
+    ``"management"`` pins management unconditionally.  Sits between the recipe
+    and the global config in the resolution chain (see
+    :func:`sparkrun.core.init_network.resolve_init_network`).
+    """
     scheduler: str | None = None
     """Default scheduler selector for workloads on this cluster.
 
@@ -334,6 +348,8 @@ class ClusterDefinition:
             d["executor"] = self.executor
         if self.executor_config:
             d["executor_config"] = dict(self.executor_config)
+        if self.init_network:
+            d["init_network"] = self.init_network
         if self.scheduler:
             d["scheduler"] = self.scheduler
         if self.max_gpu_memory_utilization is not None:
@@ -458,6 +474,7 @@ class ClusterManager:
         hosts_hardware: dict[str, HostHardware] | None = None,
         executor: str | None = None,
         executor_config: dict[str, Any] | None = None,
+        init_network: str | None = None,
         scheduler: str | None = None,
         max_gpu_memory_utilization: float | None = None,
         distribution: ClusterDistributionConfig | None = None,
@@ -517,6 +534,7 @@ class ClusterManager:
             hosts_hardware=dict(hosts_hardware) if hosts_hardware else {},
             executor=executor,
             executor_config=dict(executor_config) if executor_config else None,
+            init_network=normalize_init_network(init_network),
             scheduler=scheduler,
             max_gpu_memory_utilization=max_gpu_memory_utilization,
             distribution=distribution if distribution is not None else ClusterDistributionConfig(),
@@ -559,6 +577,7 @@ class ClusterManager:
         hosts_hardware: dict[str, HostHardware] | None = _UNSET,
         executor: str | None = _UNSET,
         executor_config: dict[str, Any] | None = _UNSET,
+        init_network: str | None = _UNSET,
         scheduler: str | None = _UNSET,
         max_gpu_memory_utilization: float | None = _UNSET,
         distribution: ClusterDistributionConfig | None = _UNSET,
@@ -648,6 +667,10 @@ class ClusterManager:
         if executor_config is not _UNSET:
             cluster_def.executor_config = dict(executor_config) if executor_config else None
             logger.debug("Updated executor_config for cluster '%s'", name)
+
+        if init_network is not _UNSET:
+            cluster_def.init_network = normalize_init_network(init_network)
+            logger.debug("Updated init_network for cluster '%s'", name)
 
         if scheduler is not _UNSET:
             cluster_def.scheduler = scheduler
@@ -793,6 +816,8 @@ class ClusterManager:
             data["executor"] = cluster_def.executor
         if cluster_def.executor_config:
             data["executor_config"] = dict(cluster_def.executor_config)
+        if cluster_def.init_network:
+            data["init_network"] = cluster_def.init_network
         if cluster_def.scheduler:
             data["scheduler"] = cluster_def.scheduler
         if cluster_def.max_gpu_memory_utilization is not None:
@@ -864,6 +889,7 @@ class ClusterManager:
             hosts_hardware=hosts_hardware,
             executor=data.get("executor"),
             executor_config=executor_config,
+            init_network=normalize_init_network(data.get("init_network")),
             scheduler=data.get("scheduler"),
             max_gpu_memory_utilization=max_gpu_memory_utilization,
             accelerator_memory_limits=accelerator_memory_limits,

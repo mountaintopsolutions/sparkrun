@@ -258,6 +258,7 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
         "dashboard_port": options.dashboard_port,
         "dashboard": options.dashboard,
         "init_port": options.init_port,
+        "init_network": options.init_network,
         "executor_config": _build_executor_overrides(options),
         "extra_docker_opts": list(options.extra_docker_opts) if options.extra_docker_opts else None,
         "rootless": not options.rootful,

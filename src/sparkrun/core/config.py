@@ -158,6 +158,20 @@ class SparkrunConfig:
         return dict(cfg) if isinstance(cfg, dict) else {}
 
     @property
+    def init_network(self) -> str | None:
+        """System-wide distributed-init network preference.
+
+        Read from ``defaults.init_network`` (or top-level ``init_network``) in
+        ``config.yaml``.  Bottom layer of
+        :func:`sparkrun.core.init_network.resolve_init_network` — a site whose
+        Sparks are always wired over CX7 can set ``fabric`` once here instead
+        of per recipe.  ``None`` (default) means "no opinion" → ``auto``.
+        """
+        defaults = self._data.get("defaults", {})
+        val = (defaults.get("init_network") if isinstance(defaults, dict) else None) or self._data.get("init_network")
+        return str(val).strip().lower() if val else None
+
+    @property
     def k8s_defaults(self) -> dict[str, Any]:
         """CLI / setup-time Kubernetes defaults (the ``k8s:`` block).
 

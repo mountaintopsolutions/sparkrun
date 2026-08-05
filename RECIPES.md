@@ -65,6 +65,7 @@ reproducible deployments.
 | `max_nodes`    | int                                 | `null`   | Maximum hosts. `null` = no limit. `1` forces `mode: solo` |
 | `solo_only`    | bool                                | `false`  | Shorthand: `max_nodes: 1, mode: solo`                     |
 | `cluster_only` | bool                                | `false`  | Shorthand: `min_nodes: 2, mode: cluster`                  |
+| `init_network` | `"auto"` \| `"fabric"` \| `"management"` | `"auto"` | Network the multi-node distributed init rendezvouses on ([details](#distributed-init-network)) |
 
 Note: `mode`, `solo_only`, and `cluster_only` are deprecated. Developers are encouraged to use  `min_nodes` and
 `max_nodes` instead.
@@ -369,7 +370,7 @@ executor_config:
 | `privileged`     | bool   | `true`      | `--privileged` | Privileged mode                                                                                                     |
 | `gpus`           | string | `"all"`     | `--gpus`       | GPU device spec                                                                                                     |
 | `ipc`            | string | `"host"`    | `--ipc`        | IPC namespace                                                                                                       |
-| `shm_size`       | string | `"10.24gb"` | `--shm-size`   | Shared memory size                                                                                                  |
+| `shm_size`       | string | `"32gb"`    | `--shm-size`   | Shared memory size                                                                                                  |
 | `network`        | string | `"host"`    | `--network`    | Network mode                                                                                                        |
 | `entrypoint`     | string | `null`      | `--entrypoint` | Override the image `ENTRYPOINT`. `null` leaves it untouched; `""` clears it so sparkrun's serve command runs directly |
 | `user`           | string | `null`      | `--user`       | UID:GID or `$SHELL_USER` (auto: `$(id -u):$(id -g)` + mount passwd/group)                                           |
@@ -386,6 +387,45 @@ Use `entrypoint: ""` for images that ship an ENTRYPOINT which consumes sparkrun'
 executor_config:
   entrypoint: ""
 ```
+
+#### Porting a docker-compose deployment
+
+`executor_config:` is the recipe's home for every container knob a
+`docker-compose.yml` would carry — there is no need for a wrapper script
+passing `-o` flags. A compose service like
+
+```yaml
+# docker-compose.yml
+shm_size: "64gb"
+ulimits: { memlock: -1, stack: 67108864 }
+devices: [/dev/infiniband:/dev/infiniband]
+```
+
+is expressed directly in the recipe:
+
+```yaml
+executor_config:
+  shm_size: 64gb
+  ulimit:
+    - memlock=-1:-1
+    - stack=67108864
+    - nofile=65535:65535   # list keys REPLACE the default, so restate what you still want
+  devices:
+    - /dev/infiniband
+```
+
+Two things to know:
+
+- **List-valued keys replace, they don't merge.** A recipe `ulimit:` overrides
+  the whole list from the layer below, so the default `nofile=65535:65535`
+  disappears unless you restate it.
+- **`sparkrun run` is rootless by default**, which already contributes
+  `memlock=-1:-1`, `stack=67108864` and `/dev/infiniband` (and drops
+  `--privileged`) — matching a typical compose deployment without any recipe
+  changes. `--rootful` opts back into the legacy privileged behavior.
+- `privileged`, `cap_add`, `security_opt`, `devices`, `user` and `volumes` are
+  trust-gated: a third-party registry recipe that sets them needs `--trust`.
+  See [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ### LocalExecutor fields (experimental, `executor: local`)
 
@@ -446,6 +486,53 @@ executor_config:
 
 All runtimes automatically inherit executor settings — no per-runtime changes
 needed.
+
+---
+
+## Distributed Init Network
+
+A DGX Spark cluster usually has two networks: the **management** LAN the hosts
+are SSH'd on (typically 1 GbE), and the **CX7 / InfiniBand fabric** the
+collective moves tensors over (typically 200 GbE, a separate subnet). Multi-node
+runtimes advertise one rendezvous address to every node
+(`--master-addr` / `--dist-init-addr`) and pin their control-plane socket
+interfaces alongside it — `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`,
+`NODE_IP` (which vLLM mirrors into `VLLM_HOST_IP`, and Ray uses for
+`--node-ip-address`).
+
+`init_network:` chooses which of the two carries that traffic:
+
+```yaml
+init_network: fabric     # auto (default) | fabric | management
+```
+
+| Value        | Behavior                                                                                                             |
+|--------------|----------------------------------------------------------------------------------------------------------------------|
+| `auto`       | Default, and the historical behavior. Management first; the fabric is substituted only if a worker can't reach the management head address. |
+| `fabric`     | Prefer the CX7/IB addresses, so the rendezvous rides the same link as the collective. Falls back to management (with a warning) if the fabric map is incomplete or unreachable. |
+| `management` | Pin the management network unconditionally; never substitute the fabric.                                             |
+
+`ib`, `infiniband` and `cx7` are accepted spellings of `fabric`; `mgmt` of
+`management`.
+
+Resolution is layered, highest precedence first:
+
+**`sparkrun run --init-network …` → recipe `init_network:` → cluster
+`init_network:` → `SparkrunConfig.defaults.init_network` → `auto`.**
+
+Because it's a cluster property more than a workload property, the usual home
+is the cluster:
+
+```bash
+sparkrun cluster update mylab --init-network fabric
+```
+
+This is a *preference*, never a hard requirement — a fabric that can't be
+resolved or reached degrades to management with a warning rather than failing
+the launch. sparkrun discovers the fabric addresses itself (the same CX7/IB
+probe that drives NCCL env and fast transfers); you do **not** need to list
+fabric IPs in `--hosts`, and SSH keeps using the management addresses either
+way.
 
 ---
 

@@ -92,6 +92,14 @@ class RunOptions:
     runtime emits ``--include-dashboard=False`` to override Ray's on-by-default."""
     init_port: int = 25000
     """vLLM/SGLang distributed init port."""
+    init_network: str | None = None
+    """Which network multi-node distributed init rendezvouses on.
+
+    ``None`` (default) defers to the recipe / cluster / config chain, which
+    itself defaults to ``"auto"``.  ``"fabric"`` prefers the CX7/IB addresses
+    so ``MASTER_ADDR`` / ``NODE_IP`` ride the same link as the collective;
+    ``"management"`` pins the management network.  See
+    :mod:`sparkrun.core.init_network`."""
 
     # Executor knobs (forwarded to ``resolve_executor`` as cli_overrides).
     executor: str | None = None

@@ -433,6 +433,7 @@ def launch_inference(
     dashboard_port: int | None = None,
     dashboard: bool | None = None,
     init_port: int | None = None,
+    init_network: str | None = None,
     topology: str | None = None,
     cluster_id_override: str | None = None,
     # Executor config (dict for config chain layering)
@@ -499,6 +500,10 @@ def launch_inference(
             runtime resolve it against ``recipe.runtime_config.dashboard``
             (defaulting on).
         init_port: Distributed init port (forwarded to runtime.run).
+        init_network: CLI layer of the distributed-init network preference
+            (``auto`` / ``fabric`` / ``management``); ``None`` defers to the
+            recipe / cluster / config chain.  See
+            :mod:`sparkrun.core.init_network`.
         executor_config: Executor config
         rootless: Run containers in rootless mode (applies defaults to executor_config)
         auto_user: Automatically set user and group IDs to match host. (applies defaults to executor_config)
@@ -1004,6 +1009,10 @@ def launch_inference(
     run_kwargs["dashboard"] = dashboard
     if init_port is not None:
         run_kwargs["init_port"] = init_port
+    # CLI layer of the init-network preference chain; ``None`` means the CLI
+    # expressed none, so the recipe / cluster / config layers decide.
+    if init_network is not None:
+        run_kwargs["init_network"] = init_network
     if topology is not None:
         run_kwargs["topology"] = topology
 

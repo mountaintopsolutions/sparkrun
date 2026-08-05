@@ -90,6 +90,7 @@ Core domain logic extracted from the top-level package. All imports use `sparkru
 | `placement.py`          | `compute_placement()` — rank → (host, local-GPU) honoring `RecipeLayout`             |
 | `layout.py`             | `RecipeLayout` / `Placement` dataclasses parsed from recipe `layout:` block          |
 | `launcher.py`           | `launch_inference()`, `resolve_per_host_backends()`, `resolve_recipe_trust()`        |
+| `init_network.py`       | `resolve_init_network()` — CLI → recipe → cluster → config init-network preference   |
 
 ### CLI Architecture (`cli/`)
 
@@ -240,6 +241,45 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`executors/`** — Executor plugin package. `_base.py` (ABC + dataclass), `docker.py` (default), `local.py` (experimental, no container), `k8s.py` (experimental draft, `kubectl run`-driven). Discovered via SAF. Each declares a `status_scope` (default `"host"`).
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
 - **`hooks.py`** — `pre_exec` / `post_exec` / `post_commands` runners. Trust gating via `_confirm_hook_execution(trust=...)`.
+
+### Distributed Init Network (management vs CX7 fabric)
+
+A multi-node launch has to advertise **one** rendezvous address
+(`--master-addr` / `--dist-init-addr`) and pin the control-plane socket
+interfaces alongside it (`NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`,
+`NODE_IP` → vLLM's `VLLM_HOST_IP`, Ray's `--node-ip-address`). On a DGX Spark
+cluster that address can live on the management LAN (the SSH path) or on the
+CX7/IB fabric (the link the collective actually uses).
+
+The *detection* has always been there — `infiniband.detect_ib_for_hosts`
+resolves per-host fabric IPs + interfaces, and `infiniband.pin_comm_env_to_ib`
+re-pins a whole `ClusterCommEnv` onto them. What `core/init_network.py` adds is
+the **policy**: historically the fabric was used *only* as a failure fallback
+(`select_init_network` substituted it when a worker couldn't reach the
+management head). `init_network` makes that an explicit preference:
+
+- `auto` (default) — unchanged legacy behavior, management-first with fabric fallback.
+- `fabric` (aliases `ib` / `cx7` / `infiniband`) — prefer the fabric; degrade to
+  management **with a warning** if the address map is incomplete or unreachable.
+  Never a hard failure.
+- `management` (alias `mgmt`) — pin management, skip the reachability probe.
+
+`resolve_init_network()` layers CLI → recipe `init_network:` → cluster
+`init_network:` → `SparkrunConfig.init_network` → `auto`, and is called exactly
+once per launch in `ClusterContext.build`, landing on `ClusterContext.init_network`.
+Two consumers read it:
+
+- **Native runtimes** (vllm-distributed, sglang, trtllm) — `select_init_network`
+  in `runtimes/_init_network.py` picks the address set; the existing
+  `pin_comm_env_to_ib` call then follows the verdict.
+- **Ray** (`vllm-ray`) — has no `select_init_network` step (the head address
+  comes back from `ray start`, which advertises `NODE_IP`), so the comm env
+  *is* the lever: `_cluster_ops.resolve_comm_env_for_init` pins it when the
+  preference is `fabric` and is byte-identical to `resolve_comm_env` otherwise.
+
+SSH always stays on the management addresses — the preference only moves the
+workload's own rendezvous/control traffic, so there is no need to pass fabric
+IPs as `--hosts`.
 
 ### Status Discovery ("what's running where?")
 

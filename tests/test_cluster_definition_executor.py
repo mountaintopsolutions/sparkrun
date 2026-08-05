@@ -379,3 +379,57 @@ def test_resolve_cluster_config_scheduler_applies_even_with_explicit_hosts(tmp_p
     # but the scheduler selector should propagate.
     assert resolved.transfer_mode is None
     assert resolved.scheduler == "occupancy-sparse"
+
+
+# --------------------------------------------------------------------------
+# init_network — cluster-level distributed-init network preference
+# --------------------------------------------------------------------------
+
+
+def test_cluster_definition_init_network_defaults_none():
+    """Unset means 'no opinion' → the resolver falls through to auto."""
+    assert ClusterDefinition(name="c", hosts=["h1"]).init_network is None
+
+
+def test_init_network_round_trips_through_yaml(tmp_path: Path):
+    """Written then re-read, the preference survives verbatim."""
+    mgr = ClusterManager(tmp_path)
+    mgr.create("c", ["h1", "h2"], init_network="fabric")
+
+    assert mgr.get("c").init_network == "fabric"
+
+
+def test_create_normalizes_an_alias(tmp_path: Path):
+    """``ib`` is the operator spelling; it is stored canonically."""
+    mgr = ClusterManager(tmp_path)
+    mgr.create("c", ["h1"], init_network="ib")
+
+    assert mgr.get("c").init_network == "fabric"
+
+
+def test_update_sets_and_clears_init_network(tmp_path: Path):
+    """Update writes the preference; ``None`` clears it back to the default."""
+    mgr = ClusterManager(tmp_path)
+    mgr.create("c", ["h1"])
+    assert mgr.get("c").init_network is None
+
+    mgr.update("c", init_network="management")
+    assert mgr.get("c").init_network == "management"
+
+    mgr.update("c", init_network=None)
+    assert mgr.get("c").init_network is None
+
+
+def test_cluster_yaml_without_init_network_still_loads(tmp_path: Path):
+    """Back-compat: pre-existing cluster files have no such key."""
+    mgr = ClusterManager(tmp_path)
+    (tmp_path / "clusters").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "clusters" / "legacy.yaml").write_text("name: legacy\nhosts:\n  - h1\n")
+
+    assert mgr.get("legacy").init_network is None
+
+
+def test_to_dict_omits_an_unset_init_network():
+    """The key is only serialized when it carries a preference."""
+    assert "init_network" not in ClusterDefinition(name="c", hosts=["h1"]).to_dict()
+    assert ClusterDefinition(name="c", hosts=["h1"], init_network="fabric").to_dict()["init_network"] == "fabric"
