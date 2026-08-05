@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 import yaml
@@ -835,6 +836,18 @@ class TestRecipeMetadata:
         issues = recipe.validate()
         assert any("kv_dtype" in i for i in issues)
 
+    @pytest.mark.parametrize("kv_dtype", ["nvfp4_ds_mla", "fp8_ds_mla", "nvfp4"])
+    def test_validate_accepts_mla_kv_layouts(self, kv_dtype):
+        """MLA layouts are packed uint8 slots, not per-element dtypes, but are valid."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {"kv_dtype": kv_dtype},
+            }
+        )
+        assert not any("kv_dtype" in i for i in recipe.validate())
+
     def test_validate_good_metadata(self):
         """Test that valid metadata passes validation without issues."""
         recipe = Recipe.from_dict(
@@ -1016,6 +1029,35 @@ class TestRecipeMetadata:
         )
         est = recipe.estimate_vram(auto_detect=False)
         assert est.kv_dtype == "fp8"
+
+    def test_estimate_vram_nvfp4_ds_mla_from_defaults(self):
+        """kv_cache_dtype: nvfp4_ds_mla plus an auto-detected MLA config sizes the latent cache.
+
+        The generic 2 * layers * kv_heads * head_dim formula reads 86 GB for this
+        model at 1M context, which would refuse any placement; MLA reads ~3 GB.
+        """
+        from tests.test_vram import DEEPSEEK_V4_CONFIG
+
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla", "tensor_parallel": 2},
+            }
+        )
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=DEEPSEEK_V4_CONFIG),
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+        ):
+            est = recipe.estimate_vram()
+
+        assert est.mla
+        assert est.kv_dtype == "nvfp4_ds_mla"
+        assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
+        assert est.kv_cache_total_gb == pytest.approx(3.08, abs=0.01)
+        # Weights shard across the 2 ranks; the MLA latent cache does not.
+        assert est.total_per_gpu_gb == pytest.approx(340.0 / 2 + est.kv_cache_total_gb)
 
     def test_estimate_vram_gpu_memory_utilization(self):
         """Test that gpu_memory_utilization from defaults flows through."""

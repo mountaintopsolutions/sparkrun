@@ -567,7 +567,11 @@ Before launching, sparkrun can pre-sync models and container images from the con
   `docker save | ssh docker load` (`containers/distribute.py`, `containers/sync.py`). Checks image IDs to skip hosts
   that already have the correct image.
 - **VRAM estimation** (`models/vram.py`): Estimates VRAM usage based on model parameter count, dtype, and quantization.
-  Supports HuggingFace model auto-detection to resolve parameter counts.
+  Supports HuggingFace model auto-detection to resolve parameter counts. KV cache sizing has two paths: the generic
+  `2 * layers * kv_heads * head_dim * bytes` formula, and an **MLA** path for DeepSeek architectures, which cache one
+  compressed latent per token per layer. MLA is selected by `kv_lora_rank` in the HF config or by a fixed-slot KV
+  layout named in the recipe (`nvfp4_ds_mla` / `fp8_ds_mla`, sized from `_MLA_SLOT_BYTES` and DeepSeek V4's per-layer
+  `compress_ratios`). The MLA latent cache is **replicated across TP ranks**, so only pipeline parallelism divides it.
 
 ### Kernel Tuning (`tuning/`)
 

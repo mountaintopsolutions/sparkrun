@@ -1048,7 +1048,7 @@ class Recipe:
 
         # Validate metadata if present
         if self.metadata:
-            from sparkrun.models.vram import parse_param_count, bytes_per_element
+            from sparkrun.models.vram import parse_param_count, bytes_per_element, is_mla_kv_layout, kv_bytes_per_element
 
             mp = self.metadata.get("model_params")
             if mp is not None and parse_param_count(mp) is None:
@@ -1057,7 +1057,9 @@ class Recipe:
             if md is not None and bytes_per_element(str(md)) is None:
                 issues.append("metadata.model_dtype %r is not a recognized dtype" % md)
             kd = self.metadata.get("kv_dtype")
-            if kd is not None and bytes_per_element(str(kd)) is None:
+            # MLA layouts (nvfp4_ds_mla, fp8_ds_mla) are packed uint8 slots, not
+            # a per-element dtype, so they have no bytes_per_element entry.
+            if kd is not None and kv_bytes_per_element(str(kd)) is None and not is_mla_kv_layout(str(kd)):
                 issues.append("metadata.kv_dtype %r is not a recognized dtype" % kd)
             mq = self.metadata.get("quantization")
             if mq is not None:
@@ -1164,6 +1166,11 @@ class Recipe:
         head_dim = self.metadata.get("head_dim")
         model_vram = self.metadata.get("model_vram")
         kv_vram_per_token = self.metadata.get("kv_vram_per_token")
+        # MLA architecture fields — auto-detected below, overridable in metadata.
+        kv_lora_rank = self.metadata.get("kv_lora_rank")
+        qk_rope_head_dim = self.metadata.get("qk_rope_head_dim")
+        compress_ratios = self.metadata.get("compress_ratios")
+        model_type = self.metadata.get("model_type")
         quant_info: QuantizationInfo | None = None
         _storage_dtype: str | None = None  # raw torch_dtype before quant override
         effective_recipe_quant: str | None = None  # recipe-level quantization override
@@ -1207,6 +1214,18 @@ class Recipe:
                         num_kv_heads = hf_info.get("num_kv_heads")
                     if not head_dim:
                         head_dim = hf_info.get("head_dim")
+
+                    # MLA architectures (DeepSeek V2/V3/V4): the KV cache holds
+                    # a compressed latent per token per layer, so it is sized
+                    # from these rather than num_kv_heads * head_dim.
+                    if not kv_lora_rank:
+                        kv_lora_rank = hf_info.get("kv_lora_rank")
+                    if not qk_rope_head_dim:
+                        qk_rope_head_dim = hf_info.get("qk_rope_head_dim")
+                    if not compress_ratios:
+                        compress_ratios = hf_info.get("compress_ratios")
+                    if not model_type:
+                        model_type = hf_info.get("model_type")
 
                     # Use kv_cache_quant from hf_quant_config to inform kv_dtype
                     if not kv_dtype and quant_info and quant_info.kv_cache_quant:
@@ -1298,6 +1317,10 @@ class Recipe:
             kv_vram_per_token=float(kv_vram_per_token) if kv_vram_per_token is not None else None,
             gpu_memory_utilization=gpu_memory_utilization,
             total_gpu_memory_gb=total_gpu_memory_gb,
+            kv_lora_rank=int(kv_lora_rank) if kv_lora_rank is not None else None,
+            qk_rope_head_dim=int(qk_rope_head_dim) if qk_rope_head_dim is not None else None,
+            compress_ratios=[int(r) for r in compress_ratios] if compress_ratios else None,
+            model_type=str(model_type) if model_type else None,
         )
 
         # Write back auto-detected values so downstream consumers

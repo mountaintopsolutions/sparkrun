@@ -103,7 +103,7 @@ metadata:
   category: agent
   model_params: 8B           # or 8000000000
   model_dtype: bfloat16      # float32, float16, bfloat16, int8, fp8, int4, awq4, gptq, nvfp4, q4_k_m, q8_0, ...
-  kv_dtype: fp8_e5m2         # KV cache dtype (default: bfloat16)
+  kv_dtype: fp8_e5m2         # KV cache dtype (default: bfloat16); also accepts nvfp4_ds_mla / fp8_ds_mla
   num_layers: 32
   num_kv_heads: 8
   head_dim: 128
@@ -118,6 +118,39 @@ sparkrun auto-detects `model_params`, `model_dtype`, `num_layers`, `num_kv_heads
 `hf_quant_config.json` (modelopt supplement, e.g. NVIDIA NVFP4 models) are checked. When `hf_quant_config.json`
 contains `kv_cache_quant_algo`, it is used to set `kv_dtype` if not already specified. Metadata values always take
 precedence over auto-detected values.
+
+#### Multi-head Latent Attention (DeepSeek)
+
+MLA models cache one *compressed latent* per token per layer instead of a K and V entry per attention head, so the
+generic `2 * num_layers * num_kv_heads * head_dim * bytes` sizing overestimates their KV cache by one to two orders of
+magnitude. sparkrun detects MLA from the HuggingFace config (`qk_rope_head_dim`, plus `kv_lora_rank` on V2/V3 or
+`head_dim` on V4) and sizes the latent cache instead. Auto-detected fields, all overridable in `metadata`:
+
+| Field               | Meaning                                                                                  |
+|---------------------|------------------------------------------------------------------------------------------|
+| `kv_lora_rank`      | Compressed-latent dimension. Its presence switches KV sizing to the MLA path.             |
+| `qk_rope_head_dim`  | RoPE tail cached alongside the latent.                                                    |
+| `compress_ratios`   | DeepSeek V4 per-layer cache compression; layers at ratio ≤ 1 are sliding-window layers.   |
+| `model_type`        | Selects the packed slot layout (e.g. `deepseek_v4`).                                      |
+
+Runtimes that pack the latent, its block scales and the RoPE tail into a fixed-width uint8 slot are named through
+`kv_dtype` / `defaults.kv_cache_dtype`: `fp8_ds_mla` and `nvfp4_ds_mla` (656 bytes per token per layer; 584 on
+DeepSeek V4). Naming one of these is on its own enough to select MLA sizing.
+
+Two consequences worth knowing when reading an estimate:
+
+- **The latent cache is replicated on every tensor-parallel rank** — it has no head dimension to shard — so raising
+  `--tp` does not shrink it. Pipeline parallelism still splits it by layer.
+- For DeepSeek V4 the estimate covers the **latent cache only**. The sliding-window and sparse-indexer caches are
+  excluded and reported as a warning.
+
+Use `kv_vram_per_token` to override the whole calculation if a runtime's real footprint differs.
+
+> **Pinning architecture metadata on an MLA model.** Setting `num_layers`, `num_kv_heads` and `head_dim` in
+> `metadata` suppresses the HuggingFace config fetch, so MLA can no longer be auto-detected and the estimate falls
+> back to the generic formula — for DeepSeek-V3 that reads 122 GB instead of 2.1 GB at 32k context. Pin
+> `qk_rope_head_dim` (and `kv_lora_rank`, unless `head_dim` already holds the latent) alongside them, or name an
+> `*_ds_mla` layout in `kv_dtype`; any one of those signals is enough.
 
 ### Benchmark
 

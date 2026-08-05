@@ -13,8 +13,26 @@ from sparkrun.models.vram import (
     extract_model_info,
     fetch_safetensors_params,
     fetch_safetensors_size,
+    is_mla_kv_layout,
+    kv_bytes_per_element,
+    mla_kv_bytes_per_token,
     parse_param_count,
 )
+
+# DeepSeek-V4-Flash-0731 config.json (abridged to the fields the estimator reads).
+# 21 layers at compress_ratio 4, 20 at 128; ratio-0 layers are sliding-window.
+DEEPSEEK_V4_CONFIG = {
+    "model_type": "deepseek_v4",
+    "torch_dtype": "bfloat16",
+    "num_hidden_layers": 43,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 1,
+    "hidden_size": 4096,
+    "head_dim": 512,
+    "qk_rope_head_dim": 64,
+    "sliding_window": 128,
+    "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
+}
 
 
 class TestParseParamCount:
@@ -937,3 +955,191 @@ class TestResolveTargetAccelerator:
 
         assert _resolve_target_accelerator(C(), None) == (None, None)
         assert _resolve_target_accelerator(None, None) == (None, None)
+
+
+class TestKvBytesPerElement:
+    """KV cache packing differs from weight packing for NVFP4."""
+
+    def test_nvfp4_kv_includes_block_scales(self):
+        # fp4 data (head_size // 2) + fp8 block scales (head_size // 16)
+        assert bytes_per_element("nvfp4") == 0.5
+        assert kv_bytes_per_element("nvfp4") == 0.5625
+
+    def test_falls_back_to_weight_table(self):
+        assert kv_bytes_per_element("bfloat16") == 2.0
+        assert kv_bytes_per_element("fp8") == 1.0
+
+    def test_unknown_dtype(self):
+        assert kv_bytes_per_element("not-a-dtype") is None
+
+
+class TestMlaKvLayout:
+    """Fixed-width DeepSeek MLA KV slot layouts."""
+
+    def test_recognized_layouts(self):
+        assert is_mla_kv_layout("nvfp4_ds_mla")
+        assert is_mla_kv_layout("fp8_ds_mla")
+        assert is_mla_kv_layout("nvfp4-ds-mla")  # hyphen spelling
+        assert not is_mla_kv_layout("bfloat16")
+        assert not is_mla_kv_layout("nvfp4")
+
+    def test_v3_style_656_byte_slot(self):
+        """Without compress_ratios every layer stores one 656-byte slot per token."""
+        assert mla_kv_bytes_per_token(kv_dtype="fp8_ds_mla", num_layers=61) == 61 * 656
+
+    def test_deepseek_v4_uses_584_byte_envelope(self):
+        # 21 layers at ratio 4 + 20 at ratio 128; ratio-0 layers are excluded.
+        expected = 21 * (584 / 4) + 20 * (584 / 128)
+        got = mla_kv_bytes_per_token(
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=43,
+            compress_ratios=DEEPSEEK_V4_CONFIG["compress_ratios"],
+            model_type="deepseek_v4",
+        )
+        assert got == pytest.approx(expected)
+        assert got == pytest.approx(3157.25)
+
+    def test_fp8_and_nvfp4_share_the_v4_envelope(self):
+        kwargs = dict(num_layers=43, compress_ratios=DEEPSEEK_V4_CONFIG["compress_ratios"], model_type="deepseek_v4")
+        assert mla_kv_bytes_per_token(kv_dtype="fp8_ds_mla", **kwargs) == mla_kv_bytes_per_token(kv_dtype="nvfp4_ds_mla", **kwargs)
+
+    def test_generic_mla_sizes_from_latent(self):
+        """Non-slot dtypes: (kv_lora_rank + qk_rope_head_dim) elements per layer."""
+        got = mla_kv_bytes_per_token(kv_dtype="bfloat16", num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64)
+        assert got == 61 * (512 + 64) * 2.0
+
+    def test_returns_none_without_enough_info(self):
+        assert mla_kv_bytes_per_token(kv_dtype="bfloat16", num_layers=61) is None
+        assert mla_kv_bytes_per_token(kv_dtype="fp8_ds_mla") is None
+
+
+class TestMlaEstimateVram:
+    """End-to-end MLA sizing through estimate_vram()."""
+
+    def _v4_kwargs(self, **overrides):
+        info = extract_model_info(DEEPSEEK_V4_CONFIG)
+        kwargs = dict(
+            model_vram=340.0,
+            num_layers=info["num_layers"],
+            num_kv_heads=info["num_kv_heads"],
+            head_dim=info["head_dim"],
+            kv_lora_rank=info.get("kv_lora_rank"),
+            qk_rope_head_dim=info.get("qk_rope_head_dim"),
+            compress_ratios=info.get("compress_ratios"),
+            model_type=info.get("model_type"),
+            max_model_len=1_048_576,
+            kv_dtype="nvfp4_ds_mla",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_nvfp4_ds_mla_replaces_the_bf16_mha_estimate(self):
+        """The generic 2*L*heads*head_dim formula reads 86 GB; MLA is ~3 GB."""
+        generic = estimate_vram(
+            model_vram=340.0,
+            num_layers=43,
+            num_kv_heads=1,
+            head_dim=512,
+            max_model_len=1_048_576,
+        )
+        assert generic.kv_cache_total_gb == pytest.approx(86.0, abs=0.1)
+        assert not generic.mla
+
+        est = estimate_vram(**self._v4_kwargs())
+        assert est.mla
+        assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
+        assert est.kv_cache_total_gb == pytest.approx(3.08, abs=0.01)
+
+    def test_kv_cache_is_replicated_across_tensor_parallel_ranks(self):
+        """MLA's latent has no head dim to shard, so TP does not shrink the KV cache."""
+        tp1 = estimate_vram(**self._v4_kwargs(tensor_parallel=1))
+        tp2 = estimate_vram(**self._v4_kwargs(tensor_parallel=2))
+        assert tp2.kv_cache_replicated
+        # Weights halve, KV does not.
+        assert tp2.total_per_gpu_gb == pytest.approx(tp1.model_weights_gb / 2 + tp1.kv_cache_total_gb)
+
+    def test_pipeline_parallel_still_splits_the_kv_cache(self):
+        """Layers — and therefore their latent caches — do split across PP stages."""
+        pp1 = estimate_vram(**self._v4_kwargs(pipeline_parallel=1))
+        pp2 = estimate_vram(**self._v4_kwargs(pipeline_parallel=2))
+        assert pp2.total_per_gpu_gb == pytest.approx(pp1.model_weights_gb / 2 + pp1.kv_cache_total_gb / 2)
+
+    def test_warns_that_auxiliary_caches_are_excluded(self):
+        est = estimate_vram(**self._v4_kwargs())
+        assert any("sliding-window" in w for w in est.warnings)
+
+    def test_mla_layout_alone_is_enough(self):
+        """A recipe naming nvfp4_ds_mla gets MLA sizing even with no architecture info."""
+        est = estimate_vram(model_vram=340.0, kv_dtype="nvfp4_ds_mla", num_layers=43, max_model_len=131_072)
+        assert est.mla
+        assert est.kv_cache_per_token_bytes == 43 * 656
+
+    def test_kv_vram_per_token_override_still_wins(self):
+        est = estimate_vram(**self._v4_kwargs(kv_vram_per_token=1e-6))
+        assert est.kv_cache_total_gb == pytest.approx(1e-6 * 1_048_576)
+
+    def test_unsizable_mla_degrades_with_a_warning(self):
+        est = estimate_vram(model_vram=10.0, kv_dtype="bfloat16", kv_lora_rank=512, max_model_len=4096)
+        assert est.kv_cache_total_gb is None
+        assert any("MLA" in w for w in est.warnings)
+
+
+class TestExtractModelInfoMla:
+    """MLA architecture fields pulled out of a HuggingFace config."""
+
+    def test_deepseek_v4(self):
+        info = extract_model_info(DEEPSEEK_V4_CONFIG)
+        assert info["model_type"] == "deepseek_v4"
+        assert info["qk_rope_head_dim"] == 64
+        # V4 carries the latent dim in head_dim rather than kv_lora_rank.
+        assert info["kv_lora_rank"] == 512
+        assert info["compress_ratios"][:4] == [0, 0, 4, 128]
+
+    def test_deepseek_v3_uses_kv_lora_rank(self):
+        info = extract_model_info(
+            {
+                "model_type": "deepseek_v3",
+                "num_hidden_layers": 61,
+                "num_attention_heads": 128,
+                "hidden_size": 7168,
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+            }
+        )
+        assert info["kv_lora_rank"] == 512
+        assert "compress_ratios" not in info
+
+    def test_non_mla_model_has_no_mla_fields(self):
+        info = extract_model_info({"model_type": "llama", "num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096})
+        assert "kv_lora_rank" not in info
+        assert "qk_rope_head_dim" not in info
+
+
+class TestMlaDetectionSignals:
+    """Each independent signal that should select MLA sizing."""
+
+    def test_qk_rope_head_dim_with_pinned_head_dim(self):
+        """A recipe pinning head_dim + qk_rope_head_dim skips HF detection but still gets MLA sizing."""
+        est = estimate_vram(
+            model_vram=340.0,
+            num_layers=43,
+            num_kv_heads=1,
+            head_dim=512,
+            qk_rope_head_dim=64,
+            max_model_len=32768,
+        )
+        assert est.mla
+        assert est.kv_cache_per_token_bytes == 43 * (512 + 64) * 2.0
+
+    def test_kv_lora_rank_alone(self):
+        est = estimate_vram(model_vram=340.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, max_model_len=32768)
+        assert est.mla
+        # DeepSeek's published figure for V3: ~70 KB per token.
+        assert est.kv_cache_per_token_bytes == 70_272
+
+    def test_non_mla_model_is_untouched(self):
+        """Standard GQA sizing must not change for models with no MLA markers."""
+        est = estimate_vram(model_vram=60.0, num_layers=64, num_kv_heads=8, head_dim=128, max_model_len=32768)
+        assert not est.mla
+        assert not est.kv_cache_replicated
+        assert est.kv_cache_per_token_bytes == 2.0 * 64 * 8 * 128 * 2.0

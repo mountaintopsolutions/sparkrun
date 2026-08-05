@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,6 +72,35 @@ _DTYPE_BYTES: dict[str, float] = {
     "tq2_0": 0.3125,
 }
 
+# Bytes per element for dtypes whose *KV cache* packing differs from their
+# weight packing.  Consulted by :func:`kv_bytes_per_element` before
+# :data:`_DTYPE_BYTES`.
+#
+# NVFP4 KV cache stores fp8 block scales alongside the fp4 data (one scale
+# per 16 elements), so the packed last dimension is
+# ``head_size // 2 + head_size // 16`` — 0.5625 bytes per element, not 0.5.
+_KV_DTYPE_BYTES: dict[str, float] = {
+    "nvfp4": 0.5625,
+    "w4a16_nvfp4": 0.5625,
+}
+
+# Fixed-width KV slot layouts used by DeepSeek Multi-head Latent Attention
+# runtimes.  These backends pack the compressed latent, its block scales and
+# the RoPE tail into one padded uint8 slot per token per layer, so the
+# footprint is a constant rather than ``2 * heads * head_dim * bytes``.
+#
+# Keyed by KV cache dtype, then by ``model_type`` (``None`` = the fallback for
+# any MLA model that isn't special-cased).
+_MLA_SLOT_BYTES: dict[str, dict[str | None, int]] = {
+    # V3.2 sparse MLA: kv_lora_rank 512 in fp8 (512 B) + 4 fp32 block scales
+    # (16 B) + qk_rope_head_dim 64 in bfloat16 (128 B) = 656 B.
+    # DeepSeek V4 pads to the 584 B sparse-MLA envelope instead.
+    "fp8_ds_mla": {None: 656, "deepseek_v4": 584},
+    # NVFP4 latent + fp8 block scales.  V4 reuses the same 584 B envelope as
+    # fp8_ds_mla (the padding, not the element width, sets the slot size).
+    "nvfp4_ds_mla": {None: 656, "deepseek_v4": 584},
+}
+
 # Shorthand suffixes for parameter counts
 _PARAM_SUFFIXES = {
     "T": 1_000_000_000_000,
@@ -113,6 +143,18 @@ class VRAMEstimate:
     num_layers: int | None = None
     num_kv_heads: int | None = None
     head_dim: int | None = None
+
+    # Multi-head Latent Attention
+    mla: bool = False
+    """Whether the KV cache was sized as an MLA compressed latent cache."""
+
+    kv_cache_replicated: bool = False
+    """Whether the KV cache is duplicated on every tensor-parallel rank.
+
+    True for MLA: the compressed latent has no head dimension to shard, so each
+    TP rank holds the full cache and ``tensor_parallel`` does not reduce the
+    per-GPU KV footprint (pipeline parallelism still splits it by layer).
+    """
 
     # GPU memory budget fields
     gpu_memory_utilization: float | None = None
@@ -163,6 +205,76 @@ def normalize_dtype(dtype: str) -> str:
 def bytes_per_element(dtype: str) -> float | None:
     """Return bytes per element for a dtype string, or None if unknown."""
     return _DTYPE_BYTES.get(dtype.lower().strip().replace("-", "_"))
+
+
+def kv_bytes_per_element(dtype: str) -> float | None:
+    """Return bytes per KV-cache element for a dtype string, or None if unknown.
+
+    Same as :func:`bytes_per_element` except for dtypes whose KV cache packing
+    carries extra per-block scale bytes (see :data:`_KV_DTYPE_BYTES`).
+    """
+    key = dtype.lower().strip().replace("-", "_")
+    override = _KV_DTYPE_BYTES.get(key)
+    return override if override is not None else _DTYPE_BYTES.get(key)
+
+
+def is_mla_kv_layout(kv_dtype: str) -> bool:
+    """Whether *kv_dtype* names one of the fixed-width DeepSeek MLA KV layouts."""
+    return kv_dtype.lower().strip().replace("-", "_") in _MLA_SLOT_BYTES
+
+
+def mla_kv_bytes_per_token(
+    *,
+    kv_dtype: str,
+    num_layers: int | None = None,
+    kv_lora_rank: int | None = None,
+    qk_rope_head_dim: int | None = None,
+    compress_ratios: Sequence[int] | None = None,
+    model_type: str | None = None,
+) -> float | None:
+    """Bytes of KV cache per token for a Multi-head Latent Attention model.
+
+    MLA stores one *compressed latent* per token per layer instead of a K and V
+    entry per attention head, so the generic
+    ``2 * num_layers * num_kv_heads * head_dim * bytes`` formula overestimates
+    it by one to two orders of magnitude.
+
+    Two sizings are supported:
+
+    - **Fixed-slot layouts** (``fp8_ds_mla`` / ``nvfp4_ds_mla``): the backend
+      packs the latent, its block scales and the RoPE tail into a padded uint8
+      slot of constant width — see :data:`_MLA_SLOT_BYTES`.
+    - **Everything else**: ``(kv_lora_rank + qk_rope_head_dim)`` elements per
+      layer at the KV dtype's element width.
+
+    ``compress_ratios`` is DeepSeek V4's per-layer cache compression (from the
+    HF config key of the same name).  A layer with ratio ``r > 1`` stores one
+    slot per ``r`` tokens; layers with ratio ``<= 1`` are sliding-window layers
+    whose cache is bounded by ``sliding_window`` rather than ``max_model_len``,
+    so they contribute nothing at this scale and are excluded.
+
+    Returns:
+        Bytes per token summed over all layers, or ``None`` when neither
+        sizing has enough information.
+    """
+    key = kv_dtype.lower().strip().replace("-", "_")
+
+    slots = _MLA_SLOT_BYTES.get(key)
+    if slots is not None:
+        per_layer: float = slots.get(model_type, slots[None])
+    else:
+        if not kv_lora_rank:
+            return None
+        bpe = kv_bytes_per_element(key)
+        if bpe is None:
+            return None
+        per_layer = (kv_lora_rank + (qk_rope_head_dim or 0)) * bpe
+
+    if compress_ratios:
+        return sum(per_layer / r for r in compress_ratios if r and r > 1)
+    if not num_layers:
+        return None
+    return per_layer * num_layers
 
 
 def parse_param_count(value: int | float | str) -> int | None:
@@ -533,6 +645,22 @@ def _extract_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 info["head_dim"] = cfg["hidden_size"] // cfg[key]
                 break
 
+    # Multi-head Latent Attention (DeepSeek V2/V3/V4).  ``qk_rope_head_dim`` is
+    # the marker: these models cache one compressed latent per token per layer,
+    # so the KV cache must be sized from the latent dim rather than from
+    # num_kv_heads * head_dim.  V2/V3 name the latent ``kv_lora_rank``; V4
+    # carries it in ``head_dim`` instead.
+    if "qk_rope_head_dim" in cfg:
+        info["qk_rope_head_dim"] = cfg["qk_rope_head_dim"]
+        latent = cfg.get("kv_lora_rank") or info.get("head_dim")
+        if latent:
+            info["kv_lora_rank"] = latent
+
+    # DeepSeek V4 per-layer KV cache compression.
+    ratios = cfg.get("compress_ratios")
+    if isinstance(ratios, list):
+        info["compress_ratios"] = ratios
+
     return info
 
 
@@ -545,9 +673,15 @@ def extract_model_info(hf_config: dict[str, Any]) -> dict[str, Any]:
     as a fallback when top-level extraction yields incomplete results.
 
     Returns:
-        Dict with keys: model_dtype, num_layers, num_kv_heads, head_dim (present only if found).
+        Dict with keys: model_dtype, num_layers, num_kv_heads, head_dim,
+        model_type, and — for MLA architectures — kv_lora_rank,
+        qk_rope_head_dim, compress_ratios (present only if found).
     """
     info = _extract_from_config(hf_config)
+
+    model_type = hf_config.get("model_type")
+    if model_type:
+        info["model_type"] = model_type
 
     # For multimodal / composite models the text architecture lives in a
     # nested sub-config.  Check common nesting keys when the top-level
@@ -594,6 +728,10 @@ def estimate_vram(
     kv_vram_per_token: float | None = None,
     gpu_memory_utilization: float | None = None,
     total_gpu_memory_gb: float | None = None,
+    kv_lora_rank: int | None = None,
+    qk_rope_head_dim: int | None = None,
+    compress_ratios: Sequence[int] | None = None,
+    model_type: str | None = None,
 ) -> VRAMEstimate:
     """Estimate VRAM usage for an inference workload.
 
@@ -613,6 +751,12 @@ def estimate_vram(
         total_gpu_memory_gb: Per-GPU memory of the *target* accelerator (e.g. 48 for an
             RTX A6000). Defaults to the DGX Spark figure when unset, preserving the
             legacy single-platform estimate.
+        kv_lora_rank: MLA compressed-latent dimension. Its presence (or an MLA KV
+            layout in ``kv_dtype``) switches KV sizing to the MLA path.
+        qk_rope_head_dim: MLA RoPE tail dimension, cached alongside the latent.
+        compress_ratios: DeepSeek V4 per-layer KV cache compression ratios.
+        model_type: HuggingFace ``model_type``; selects the MLA slot layout
+            (e.g. ``deepseek_v4``).
 
     Returns:
         VRAMEstimate with per-GPU totals and any warnings.
@@ -643,13 +787,42 @@ def estimate_vram(
     kv_cache_per_token_bytes: float | None = None
     kv_cache_total_gb: float | None = None
 
+    # MLA models cache one compressed latent per token per layer.  Detected
+    # either from the architecture (kv_lora_rank / qk_rope_head_dim) or from an
+    # MLA-specific KV layout named by the recipe (fp8_ds_mla / nvfp4_ds_mla).
+    is_mla = bool(kv_lora_rank or qk_rope_head_dim) or is_mla_kv_layout(kv_dtype)
+
+    # Mirrors _extract_from_config: V2/V3 name the latent kv_lora_rank, V4
+    # carries it in head_dim.  Lets a recipe that pins head_dim + qk_rope_head_dim
+    # in metadata get MLA sizing without naming kv_lora_rank separately.
+    mla_latent = kv_lora_rank or (head_dim if qk_rope_head_dim else None)
+
     if kv_vram_per_token is not None:
         # Direct override: user provides GB per token
         kv_cache_per_token_bytes = kv_vram_per_token * (1024**3)  # convert to bytes for display
         if max_model_len:
             kv_cache_total_gb = kv_vram_per_token * max_model_len
+    elif is_mla:
+        kv_cache_per_token_bytes = mla_kv_bytes_per_token(
+            kv_dtype=kv_dtype,
+            num_layers=num_layers,
+            kv_lora_rank=mla_latent,
+            qk_rope_head_dim=qk_rope_head_dim,
+            compress_ratios=compress_ratios,
+            model_type=model_type,
+        )
+        if kv_cache_per_token_bytes is None:
+            is_mla = False
+            warnings.append("Cannot size MLA KV cache for dtype %r; KV cache estimate unavailable" % kv_dtype)
+        else:
+            if max_model_len:
+                kv_cache_total_gb = kv_cache_per_token_bytes * max_model_len / (1024**3)
+            if compress_ratios:
+                warnings.append(
+                    "MLA estimate covers the compressed latent cache only; sliding-window and sparse-indexer caches are not included"
+                )
     elif num_layers and num_kv_heads and head_dim:
-        kv_bpe = bytes_per_element(kv_dtype)
+        kv_bpe = kv_bytes_per_element(kv_dtype)
         if kv_bpe is not None:
             # Per token: 2 (K+V) * num_layers * num_kv_heads * head_dim * bytes
             kv_cache_per_token_bytes = 2.0 * num_layers * num_kv_heads * head_dim * kv_bpe
@@ -671,8 +844,11 @@ def estimate_vram(
     # Model weights split across TP * PP GPUs
     per_gpu_weights_gb = model_weights_gb / shard_factor
 
-    # KV heads also split across TP * PP GPUs
-    per_gpu_kv_gb = (kv_cache_total_gb / shard_factor) if kv_cache_total_gb else 0.0
+    # KV heads also split across TP * PP GPUs — except under MLA, where the
+    # compressed latent has no head dimension to shard and every TP rank keeps
+    # a full copy.  Pipeline parallelism still splits it by layer.
+    kv_shard_factor = pp if is_mla else shard_factor
+    per_gpu_kv_gb = (kv_cache_total_gb / kv_shard_factor) if kv_cache_total_gb else 0.0
 
     total_per_gpu_gb = per_gpu_weights_gb + per_gpu_kv_gb
 
@@ -701,7 +877,7 @@ def estimate_vram(
 
         # Estimate max context tokens that fit in available KV space
         if kv_cache_per_token_bytes and kv_cache_per_token_bytes > 0:
-            per_gpu_kv_per_token_gb = (kv_cache_per_token_bytes / shard_factor) / (1024**3)
+            per_gpu_kv_per_token_gb = (kv_cache_per_token_bytes / kv_shard_factor) / (1024**3)
             if per_gpu_kv_per_token_gb > 0:
                 max_context_tokens = int(available_kv_gb / per_gpu_kv_per_token_gb)
 
@@ -723,6 +899,8 @@ def estimate_vram(
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        mla=is_mla,
+        kv_cache_replicated=is_mla,
         gpu_memory_utilization=gpu_memory_utilization,
         total_gpu_memory_gb=_total_gpu_gb,
         usable_gpu_memory_gb=usable_gpu_memory_gb,
