@@ -19,6 +19,7 @@ from sparkrun.orchestration.transfer import TransferError
 from sparkrun.runtimes.compatibility import IncompatibleHardwareError
 
 from ._common import (
+    INIT_NETWORK,
     RECIPE_NAME,
     _apply_recipe_overrides,
     _display_vram_estimate,
@@ -119,6 +120,15 @@ def _summarize_platforms(
 @click.option("--ray-port", type=int, default=46379, help="Ray GCS port (vllm-ray)", hidden=HIDE_ADVANCED_OPTIONS)
 @click.option("--init-port", type=int, default=25000, help="vllm/SGLang distributed init port", hidden=HIDE_ADVANCED_OPTIONS)
 @click.option(
+    "--init-network",
+    default=None,
+    type=INIT_NETWORK,
+    help="Network the multi-node distributed init rendezvouses on: 'auto' (management first, CX7/IB fallback), "
+    "'fabric' (prefer CX7/IB so MASTER_ADDR/NODE_IP ride the fast link), or 'management'. "
+    "Overrides the recipe/cluster/config setting.",
+    hidden=HIDE_ADVANCED_OPTIONS,
+)
+@click.option(
     "--dashboard/--no-dashboard",
     "dashboard",
     default=None,
@@ -203,6 +213,7 @@ def run(
     image,
     ray_port,
     init_port,
+    init_network,
     dashboard,
     dashboard_port,
     dry_run,
@@ -555,6 +566,7 @@ def run(
         dashboard_port=dashboard_port,
         dashboard=dashboard,
         init_port=init_port,
+        init_network=init_network,
         executor_config=cli_executor_opts or None,
         rootful=rootful,
         diagnostics_path=diagnostics_path,

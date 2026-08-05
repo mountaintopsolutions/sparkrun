@@ -7,6 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
+from sparkrun.core.init_network import (
+    INIT_NETWORK_AUTO,
+    INIT_NETWORK_FABRIC,
+    INIT_NETWORK_MANAGEMENT,
+)
 from sparkrun.utils.shell import quote
 
 if TYPE_CHECKING:
@@ -49,20 +54,43 @@ class InitNetworkSelection:
 
 
 def select_init_network(ctx: ClusterContext, candidates: InitNetworkCandidates) -> InitNetworkSelection:
-    """Choose management init addresses unless worker reachability requires IB.
+    """Choose the address set native distributed init rendezvouses on.
 
-    Native runtimes advertise one head address to every worker.  The
-    management/default-route address remains the preferred path; CX7/IB
-    addresses are substituted only when workers cannot reach that management
-    head address and a complete, reachable IB address set is available.
+    Native runtimes advertise one head address to every worker.  Which network
+    that address lives on is driven by ``ctx.init_network`` (see
+    :mod:`sparkrun.core.init_network`):
+
+    ``auto`` (default)
+        Management/default-route remains the preferred path; CX7/IB addresses
+        are substituted only when workers cannot reach the management head
+        address and a complete, reachable IB address set is available.
+    ``fabric``
+        Prefer the CX7/IB address set, so the rendezvous rides the same link
+        the collective does.  Degrades to management (with a warning) when the
+        fabric map is incomplete or unreachable — a preference, not a demand.
+    ``management``
+        Pin management unconditionally, skipping the reachability probe.
     """
     management = InitNetworkSelection(
         head_ip=candidates.management_head_ip,
         hosts=candidates.management_hosts,
         network="management",
     )
-    if ctx.dry_run or not ctx.worker_hosts:
+    preference = getattr(ctx, "init_network", INIT_NETWORK_AUTO) or INIT_NETWORK_AUTO
+
+    if preference == INIT_NETWORK_MANAGEMENT:
+        logger.info("  Init network: management (pinned, head=%s)", candidates.management_head_ip)
         return management
+
+    if ctx.dry_run or not ctx.worker_hosts:
+        if preference == INIT_NETWORK_FABRIC:
+            # Dry run / solo: no reachability probing is possible or needed, but
+            # the requested fabric addresses should still be what we report.
+            return _build_ib_selection(ctx, candidates) or management
+        return management
+
+    if preference == INIT_NETWORK_FABRIC:
+        return _select_fabric_preferred(ctx, candidates, management)
 
     if workers_can_reach(ctx, candidates.management_head_ip):
         logger.info("  Init network: management (head=%s)", candidates.management_head_ip)
@@ -91,6 +119,40 @@ def select_init_network(ctx: ClusterContext, candidates: InitNetworkCandidates) 
         "but IB/CX7 init address %s is also not reachable; keeping management init",
         candidates.management_head_ip,
         ib_selection.head_ip,
+    )
+    return management
+
+
+def _select_fabric_preferred(
+    ctx: ClusterContext,
+    candidates: InitNetworkCandidates,
+    management: InitNetworkSelection,
+) -> InitNetworkSelection:
+    """Fabric-first selection for ``init_network: fabric``.
+
+    Mirrors the ``auto`` path with the preference inverted: take the CX7/IB
+    address set when it is complete *and* reachable from every worker,
+    otherwise warn loudly and fall back to management.  The operator asked for
+    the fast link, so a silent downgrade would hide a real fabric problem —
+    but refusing to launch over it would be worse.
+    """
+    ib_selection = _build_ib_selection(ctx, candidates)
+    if ib_selection is None:
+        logger.warning(
+            "  init_network=fabric requested, but no complete IB/CX7 address map is available; falling back to management init address %s",
+            candidates.management_head_ip,
+        )
+        return management
+
+    if workers_can_reach(ctx, ib_selection.head_ip):
+        logger.info("  Init network: ib (preferred, head=%s, hosts=%s)", ib_selection.head_ip, list(ib_selection.hosts))
+        return ib_selection
+
+    logger.warning(
+        "  init_network=fabric requested, but IB/CX7 init address %s is not reachable from all workers; "
+        "falling back to management init address %s",
+        ib_selection.head_ip,
+        candidates.management_head_ip,
     )
     return management
 

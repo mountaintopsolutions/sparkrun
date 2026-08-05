@@ -17,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
+from sparkrun.core.init_network import INIT_NETWORK_AUTO, INIT_NETWORK_FABRIC, resolve_init_network
+
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
     from sparkrun.core.cluster_manager import ClusterDefinition
@@ -71,6 +73,17 @@ class ClusterContext:
     through; runtimes that consume it must fall back to ``enumerate(hosts)``.
     """
 
+    init_network: str = INIT_NETWORK_AUTO
+    """Which network distributed init rendezvouses on (see
+    :mod:`sparkrun.core.init_network`).
+
+    ``"auto"`` (default) keeps the historical management-first-with-IB-fallback
+    behavior; ``"fabric"`` prefers the CX7/IB addresses so ``MASTER_ADDR`` /
+    ``NODE_IP`` / the socket-interface env ride the same link as the collective;
+    ``"management"`` pins management unconditionally.  Resolved once in
+    :meth:`build` from the CLI → recipe → cluster → config chain.
+    """
+
     def hardware_for(self, host: str):
         """Return per-host :class:`HostHardware` (DGX Spark default when unknown)."""
         from sparkrun.core.hardware import default_dgx_spark_hardware
@@ -95,6 +108,7 @@ class ClusterContext:
         cluster: ClusterDefinition | None = None,
         recipe: Recipe | None = None,
         placement: "RankAssignment | None" = None,
+        init_network: str | None = None,
     ) -> ClusterContext:
         """Build context from runtime hooks and config.
 
@@ -107,6 +121,11 @@ class ClusterContext:
         ``None``, and *cluster* + *recipe* are both available, the
         method recomputes placement internally for back-compat with
         callers that haven't been threaded yet.
+
+        *init_network* is the CLI layer of the init-network preference chain
+        (``None`` = the CLI expressed none); the recipe / cluster / config
+        layers are read off the objects already threaded here, so the
+        preference is resolved exactly once per launch.
         """
         from sparkrun.orchestration.primitives import build_ssh_kwargs, build_volumes, resolved_model_volume
         from sparkrun.utils import merge_env
@@ -191,6 +210,7 @@ class ClusterContext:
             topology=topology,
             cluster=cluster,
             placement=placement,
+            init_network=resolve_init_network(cli=init_network, recipe=recipe, cluster=cluster, config=config),
         )
 
 
@@ -483,6 +503,50 @@ def resolve_comm_env(
         logger.info("  No InfiniBand detected, using default networking")
         return _CCE.empty()
     return ib_result.comm_env
+
+
+def resolve_comm_env_for_init(
+    ctx: ClusterContext,
+    comm_env: ClusterCommEnv | None,
+    backends: "dict[str, BackendBundle] | None" = None,
+    ib_ip_map: dict[str, str] | None = None,
+    ib_iface_map: dict[str, str] | None = None,
+) -> ClusterCommEnv:
+    """:func:`resolve_comm_env`, honouring ``ctx.init_network`` fabric preference.
+
+    Ray-based clustering has no :func:`~sparkrun.runtimes._init_network.select_init_network`
+    step to hang the preference off: the head address comes back from ``ray
+    start``, which advertises whatever ``NODE_IP`` says.  So for Ray the lever
+    *is* the comm env — pinning it to the fabric moves Ray's
+    ``--node-ip-address``, vLLM's ``VLLM_HOST_IP``, and the socket-interface
+    vars onto the CX7 link in one step.
+
+    ``auto`` / ``management`` are untouched (byte-identical to
+    :func:`resolve_comm_env`); a fabric preference with an incomplete address
+    map warns and leaves the management-pinned env alone.
+    """
+    if (ctx.init_network or INIT_NETWORK_AUTO) != INIT_NETWORK_FABRIC:
+        return resolve_comm_env(ctx, comm_env, backends=backends)
+
+    from sparkrun.orchestration.infiniband import pin_comm_env_to_ib
+
+    comm_env, ib_ip_map, ib_iface_map = detect_ib_with_ips(
+        ctx,
+        comm_env,
+        ib_ip_map,
+        backends=backends,
+        ib_iface_map=ib_iface_map,
+    )
+    missing = [h for h in ctx.hosts if not (ib_ip_map.get(h) and ib_iface_map.get(h))]
+    if missing:
+        logger.warning(
+            "  init_network=fabric requested, but no IB/CX7 address is available for host(s) %s; "
+            "leaving the comm env on the management network",
+            ", ".join(missing),
+        )
+        return comm_env
+    logger.info("  Init network: ib (preferred, comm env pinned to %s)", ", ".join(sorted(set(ib_ip_map.values()))))
+    return pin_comm_env_to_ib(comm_env, ctx.hosts, ib_ip_map, ib_iface_map)
 
 
 def detect_ib_with_ips(

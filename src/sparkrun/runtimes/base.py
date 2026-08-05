@@ -1544,6 +1544,7 @@ class RuntimePlugin(Plugin):
         topology = kwargs.pop("topology", None)
         cluster = kwargs.pop("cluster", None)
         placement = kwargs.pop("placement", None)
+        init_network = kwargs.pop("init_network", None)
         ctx = ClusterContext.build(
             runtime=self,
             hosts=hosts,
@@ -1557,6 +1558,7 @@ class RuntimePlugin(Plugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            init_network=init_network,
         )
         return run_native_cluster(
             runtime=self,

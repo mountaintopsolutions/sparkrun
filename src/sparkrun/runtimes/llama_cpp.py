@@ -508,6 +508,7 @@ class LlamaCppRuntime(RuntimePlugin):
         backends = kwargs.pop("backends", None)
         trust = kwargs.pop("trust", False)
         placement = kwargs.pop("placement", None)
+        init_network = kwargs.pop("init_network", None)
 
         ctx = ClusterContext.build(
             self,
@@ -521,6 +522,7 @@ class LlamaCppRuntime(RuntimePlugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            init_network=init_network,
         )
         head_container = self._container_name(cluster_id, "head")
         worker_container_name = self._container_name(cluster_id, "worker")

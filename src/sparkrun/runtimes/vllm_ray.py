@@ -282,7 +282,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             cleanup_after_failure,
             cleanup_named_containers,
             dump_serve_log,
-            resolve_comm_env,
+            resolve_comm_env_for_init,
             find_port,
             run_pre_serve_hooks,
         )
@@ -294,6 +294,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         backends = kwargs.pop("backends", None)
         trust = kwargs.pop("trust", False)
         placement = kwargs.pop("placement", None)
+        init_network = kwargs.pop("init_network", None)
         combined_docker_opts = (self.get_extra_docker_opts() or []) + (extra_docker_opts or [])
 
         # Resolve the tri-state dashboard toggle now so the rest of the cluster
@@ -312,6 +313,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            init_network=init_network,
         )
         head_container = self._resolve_executor().container_name(cluster_id, "head")
         worker_container = self._resolve_executor().container_name(cluster_id, "worker")
@@ -337,10 +339,19 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         # When the launcher resolved per-host backends, route through
         # CollectiveBackend.env_for_host via resolve_comm_env; otherwise
         # fall through to the deprecated legacy resolver for callers
-        # that haven't threaded backends yet.
+        # that haven't threaded backends yet.  ``_for_init`` additionally
+        # re-pins the env to the CX7 fabric under ``init_network: fabric`` —
+        # Ray takes its head address from NODE_IP, so the comm env is the only
+        # lever for the rendezvous network here.
         if backends is None:
             raise RuntimeError("backends is None; legacy IB env resolution is deprecated and no backends were provided.")
-        comm_env = resolve_comm_env(ctx, comm_env, backends=backends)
+        comm_env = resolve_comm_env_for_init(
+            ctx,
+            comm_env,
+            backends=backends,
+            ib_ip_map=kwargs.get("ib_ip_map"),
+            ib_iface_map=kwargs.get("ib_iface_map"),
+        )
         logger.info("Step 2/5: IB step done (%.1fs)", time.monotonic() - t0)
 
         # Auto-detect available ports to avoid collisions with running instances

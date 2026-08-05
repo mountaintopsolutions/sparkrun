@@ -463,6 +463,7 @@ class TrtllmRuntime(RuntimePlugin):
         cluster = kwargs.pop("cluster", None)
         backends = kwargs.pop("backends", None)
         placement = kwargs.pop("placement", None)
+        init_network = kwargs.pop("init_network", None)
 
         ctx = ClusterContext.build(
             self,
@@ -476,6 +477,7 @@ class TrtllmRuntime(RuntimePlugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            init_network=init_network,
         )
         extra_docker_opts = self.get_extra_docker_opts()
 

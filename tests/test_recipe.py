@@ -2854,3 +2854,62 @@ class TestRecipeSerialization:
         restored = Recipe._deserialize(original.__getstate__())
         restored.resolve({"distributed_executor_backend": "ray"})
         assert restored.runtime == "vllm-ray"
+
+
+class TestRecipeInitNetwork:
+    """The recipe layer of the distributed-init network preference."""
+
+    def _recipe(self, **extra):
+        return Recipe.from_dict({"recipe_version": "2", "model": "m", "runtime": "vllm-distributed", **extra})
+
+    def test_defaults_to_empty_meaning_no_preference(self):
+        assert self._recipe().init_network == ""
+
+    def test_carries_a_preference(self):
+        assert self._recipe(init_network="fabric").init_network == "fabric"
+
+    def test_normalizes_an_alias(self):
+        assert self._recipe(init_network="ib").init_network == "fabric"
+
+    def test_rejects_an_unknown_value(self):
+        """A typo must fail at load time, not silently run on the slow network."""
+        with pytest.raises(RecipeError, match="init_network"):
+            self._recipe(init_network="fabrik")
+
+    def test_round_trips_through_serialization(self):
+        restored = Recipe._deserialize(self._recipe(init_network="fabric").__getstate__())
+        assert restored.init_network == "fabric"
+
+    def test_export_includes_it_only_when_set(self):
+        assert "init_network" not in self._recipe()._build_export_dict()
+        assert self._recipe(init_network="management")._build_export_dict()["init_network"] == "management"
+
+
+class TestRecipeExportExecutorConfig:
+    """Export must reproduce the recipe's container options.
+
+    An exported recipe that drops ``executor_config`` silently downgrades the
+    workload to the executor defaults on re-import — e.g. a compose-parity
+    recipe losing its 64 GB ``shm_size``.
+    """
+
+    def test_export_round_trips_executor_fields(self):
+        recipe = Recipe.from_dict(
+            {
+                "recipe_version": "2",
+                "model": "m",
+                "runtime": "vllm-distributed",
+                "executor": "docker",
+                "executor_config": {"shm_size": "64gb", "ulimit": ["memlock=-1:-1"]},
+            }
+        )
+        exported = recipe._build_export_dict()
+
+        assert exported["executor"] == "docker"
+        assert exported["executor_config"] == {"shm_size": "64gb", "ulimit": ["memlock=-1:-1"]}
+
+    def test_export_omits_unset_executor_fields(self):
+        exported = Recipe.from_dict({"recipe_version": "2", "model": "m", "runtime": "vllm-distributed"})._build_export_dict()
+
+        assert "executor" not in exported
+        assert "executor_config" not in exported
