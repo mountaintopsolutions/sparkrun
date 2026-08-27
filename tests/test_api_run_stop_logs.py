@@ -331,20 +331,25 @@ def test_logs_requires_cluster_id_or_recipe():
         api.logs()
 
 
-def _make_status(host_workloads, errors=None):
+def _make_status(host_workloads, errors=None, runtime_name=None):
     """Build a ClusterStatus for precheck tests.
 
     ``host_workloads`` maps host → list of (cluster_id, container_names).
-    A host with no entry is unreachable (goes into ``errors``).
+    A host with no entry is unreachable (goes into ``errors``).  Roles are
+    derived from the container names the way the executors derive them, so a
+    ``..._solo`` container reads as ``solo`` and ``..._node_1`` as ``node_1``.
     """
     from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail, HostOccupancy, RunningWorkload
+    from sparkrun.orchestration.job_metadata import parse_container_name
 
     hosts = []
     for host, workloads in host_workloads.items():
         ws = []
         for cid, container_names in workloads:
-            containers = tuple(ContainerDetail(name=n, role="solo", status="Up", image="img") for n in container_names)
-            ws.append(RunningWorkload(cluster_id=cid, containers=containers))
+            containers = tuple(
+                ContainerDetail(name=n, role=(parse_container_name(n) or (cid, "?"))[1], status="Up", image="img") for n in container_names
+            )
+            ws.append(RunningWorkload(cluster_id=cid, runtime_name=runtime_name, containers=containers))
         hosts.append(HostOccupancy(host=host, workloads=tuple(ws)))
     return ClusterStatus(hosts=tuple(hosts), executor="docker", errors=dict(errors or {}))
 
@@ -948,3 +953,212 @@ def test_run_occupancy_cluster_id_is_random():
     second_intent, second_token = parse_cluster_id(second)
     assert first_intent == second_intent  # same recipe → same intent
     assert first_token != second_token  # random placement token per launch
+
+
+# --------------------------------------------------------------------------
+# Placement: the workload's hosts, not the cluster's
+#
+# A solo workload occupies one host of a many-host cluster.  Reading it as if
+# it spanned the whole cluster names ``{cid}_node_0`` / ``{cid}_head`` instead
+# of ``{cid}_solo`` — a container that does not exist — and the precheck then
+# reads that absence as "the workload is gone" and deletes its job metadata,
+# stranding a *live* deployment (it can no longer be addressed by cluster_id
+# at all, because the runtime is only recorded in that metadata).
+# --------------------------------------------------------------------------
+
+SOLO_CID = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+
+
+def _capture_sources():
+    """Patch the reader and return the dict it records its sources into."""
+    captured: dict = {}
+
+    def _capture(executor, sources, **kw):
+        captured["sources"] = list(sources)
+        return iter(())
+
+    return captured, _capture
+
+
+def _solo_on_first_host(cluster_id=SOLO_CID, hosts=("h1", "h2"), runtime_name=None):
+    """Status snapshot: *cluster_id* runs as one solo container on ``hosts[0]``."""
+    return _make_status(
+        {hosts[0]: [(cluster_id, ["%s_solo" % cluster_id])], **{h: [] for h in hosts[1:]}},
+        runtime_name=runtime_name,
+    )
+
+
+def test_logs_reads_the_solo_container_when_the_cluster_has_more_hosts(tmp_path):
+    """``logs <cluster_id>`` with the *cluster's* hosts still reads ``_solo``.
+
+    The workload's placement is one host; the cluster's is two.  Deciding the
+    container name from the cluster's host count asks for ``{cid}_node_0``.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    save_job_metadata(SOLO_CID, recipe, ["h1"], cache_dir=str(tmp_path))
+    captured, capture = _capture_sources()
+
+    with (
+        patch.object(DockerExecutor, "query_status", return_value=_solo_on_first_host()),
+        patch("sparkrun.orchestration.logs.read_log_sources", capture),
+    ):
+        list(api.logs(SOLO_CID, hosts=("h1", "h2"), cache_dir=str(tmp_path)))
+
+    assert [s.container for s in captured["sources"]] == ["%s_solo" % SOLO_CID]
+
+
+def test_logs_keeps_metadata_for_a_workload_the_cluster_reports_running(tmp_path):
+    """The destructive half: a live workload's metadata must survive ``logs``.
+
+    Deleting it strands the deployment — ``logs``/``stop`` by cluster_id and
+    proxy discovery all read it, and only a relaunch can put it back.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    save_job_metadata(SOLO_CID, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    # describe_terminated would confirm `{cid}_node_0` never existed — which is
+    # true, and irrelevant: the workload is running under another name.
+    gone = [RemoteResult(host="h1", returncode=0, stdout="", stderr="")]
+    with (
+        patch.object(DockerExecutor, "query_status", return_value=_solo_on_first_host()),
+        patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=gone),
+        patch("sparkrun.orchestration.logs.read_log_sources", lambda *a, **k: iter(())),
+    ):
+        list(api.logs(SOLO_CID, hosts=("h1", "h2"), cache_dir=str(tmp_path)))
+
+    assert load_job_metadata(SOLO_CID, cache_dir=str(tmp_path)) is not None
+
+
+def test_logs_recipe_form_reads_the_workloads_host_not_the_whole_cluster(tmp_path):
+    """The recipe form scopes *discovery* to the cluster, not the *read*.
+
+    ``sparkrun logs <recipe>`` has no host argument, so it sweeps the whole
+    cluster to find the workload — and then must read the placement it found.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    save_job_metadata(SOLO_CID, recipe, ["h1"], cache_dir=str(tmp_path))
+    captured, capture = _capture_sources()
+
+    with (
+        patch("sparkrun.api._resolve.discover_cluster_id_by_intent", return_value=SOLO_CID),
+        patch.object(DockerExecutor, "query_status", return_value=_solo_on_first_host()),
+        patch("sparkrun.orchestration.logs.read_log_sources", capture),
+    ):
+        list(api.logs(recipe=recipe, hosts=("h1", "h2"), cache_dir=str(tmp_path)))
+
+    assert [s.container for s in captured["sources"]] == ["%s_solo" % SOLO_CID]
+    assert [s.host for s in captured["sources"]] == ["h1"]
+
+
+def test_logs_resolves_the_runtime_from_the_running_container_without_metadata(tmp_path):
+    """No metadata, but the cluster reports the workload and its runtime.
+
+    Containers carry a ``sparkrun.runtime`` label, which ``query_status``
+    surfaces as ``RunningWorkload.runtime_name`` — so a job launched from
+    another control machine (or one whose cache entry was lost) is still
+    readable by cluster_id.
+    """
+    captured, capture = _capture_sources()
+    snapshot = _solo_on_first_host(runtime_name="vllm-ray")
+
+    with (
+        patch.object(DockerExecutor, "query_status", return_value=snapshot),
+        patch("sparkrun.orchestration.logs.read_log_sources", capture),
+    ):
+        list(api.logs(SOLO_CID, hosts=("h1", "h2"), cache_dir=str(tmp_path)))
+
+    assert [s.container for s in captured["sources"]] == ["%s_solo" % SOLO_CID]
+
+
+def test_precheck_never_deletes_metadata_for_a_workload_still_in_the_snapshot(tmp_path):
+    """Defence in depth on the one destructive step in the log path.
+
+    The naming rules above should already keep us from asking about the wrong
+    container, but deletion is irreversible — only a relaunch rewrites the
+    entry — so the removal is additionally gated on the whole snapshot rather
+    than on the sources we happened to name.  Here the head source's host runs
+    a *different* workload (so the head reads as confirmed-absent) while ours
+    is running elsewhere in the same sweep.
+    """
+    from sparkrun.api._logs import _verify_log_source_alive
+    from sparkrun.core.log_source import LogSource
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    other = "sparkrun_bbbbbbbbbbbbbbbb_222222222222"
+    save_job_metadata(SOLO_CID, recipe, ["h1", "h2"], cache_dir=str(tmp_path))
+
+    snapshot = _make_status(
+        {
+            "h1": [(other, ["%s_solo" % other])],
+            "h2": [(SOLO_CID, ["%s_solo" % SOLO_CID])],
+        }
+    )
+    sources = [LogSource(host="h1", container="%s_node_0" % SOLO_CID, role="node_0", rank=0)]
+    gone = [RemoteResult(host="h1", returncode=0, stdout="", stderr="")]
+
+    with patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=gone):
+        with pytest.raises(api.JobNotFound):
+            _verify_log_source_alive(DockerExecutor(), sources, {}, SOLO_CID, str(tmp_path), snapshot=snapshot)
+
+    assert load_job_metadata(SOLO_CID, cache_dir=str(tmp_path)) is not None
+
+
+def test_precheck_is_inconclusive_when_the_workload_runs_under_another_name(tmp_path):
+    """A container name we did not ask about is not a death certificate.
+
+    ``query_status`` reports the workload on this host — just not under the
+    name the sources were built from.  That means our naming is wrong, not
+    that the workload stopped, so the precheck must stand down and let the
+    reader surface the substrate's own error.
+    """
+    from sparkrun.api._logs import _verify_log_source_alive
+    from sparkrun.core.log_source import LogSource
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-ray", "model": "test/m"})
+    save_job_metadata(SOLO_CID, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    snapshot = _make_status({"h1": [(SOLO_CID, ["%s_solo" % SOLO_CID])]})
+    sources = [LogSource(host="h1", container="%s_head" % SOLO_CID, role="head", rank=0)]
+
+    # No exception: inconclusive → precheck stands down.
+    _verify_log_source_alive(DockerExecutor(), sources, {}, SOLO_CID, str(tmp_path), snapshot=snapshot)
+    assert load_job_metadata(SOLO_CID, cache_dir=str(tmp_path)) is not None
+
+
+def test_logs_recipe_form_prefers_the_recorded_hosts_over_the_cluster(tmp_path):
+    """Recipe form, workload not observed: the launch's hosts still win.
+
+    ``sparkrun logs <recipe>`` names no hosts to read from — the cluster list
+    exists only to scope discovery — so a two-node job on a five-node cluster
+    must be read as two nodes, not five.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    save_job_metadata(SOLO_CID, recipe, ["h1", "h2"], cache_dir=str(tmp_path))
+    captured, capture = _capture_sources()
+
+    # Nothing observed running: the snapshot cannot correct the placement, so
+    # the recorded hosts are the best information available.
+    with (
+        patch("sparkrun.api._resolve.discover_cluster_id_by_intent", return_value=SOLO_CID),
+        patch.object(DockerExecutor, "query_status", side_effect=RuntimeError("unreachable")),
+        patch("sparkrun.orchestration.logs.read_log_sources", capture),
+    ):
+        list(api.logs(recipe=recipe, hosts=("h1", "h2", "h3", "h4", "h5"), cache_dir=str(tmp_path), scope="all"))
+
+    assert [s.host for s in captured["sources"]] == ["h1", "h2"]

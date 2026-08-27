@@ -99,6 +99,38 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
   error. sparkrun runs the server as the container foreground process, so there
   is no earlyoom supervisor to substitute.
 
+### Fixed
+
+- `sparkrun logs` no longer deletes a **running** workload's job metadata. The
+  log sources were named from the *caller's* host list rather than the
+  workload's own placement, so a solo job on one host of a multi-host cluster
+  was read as `{cid}_node_0` / `{cid}_head` instead of `{cid}_solo`. The
+  liveness precheck then found that container absent, `describe_terminated`
+  confirmed it had never existed, and the "confirmed gone → clean up stale
+  metadata" branch removed the entry for a deployment that was serving traffic.
+  Since the runtime is recorded only in that metadata, every subsequent
+  `sparkrun logs <cluster_id>` failed with "No job metadata (or no runtime
+  recorded)…" and `sparkrun status` lost the recipe label — with no way back
+  short of relaunching. Fixed in three places, each independently sufficient to
+  prevent the data loss:
+  - The sources are named from the workload's placement: the live status
+    snapshot when it shows a lone `_solo` container, else the hosts recorded at
+    launch (for the recipe form, where the caller named no hosts to read), else
+    the caller's list as before.
+  - A container name the snapshot does not report, on a host where the workload
+    *is* running, is now inconclusive rather than "confirmed absent" — it means
+    sparkrun named the container wrongly, not that the workload stopped.
+  - The metadata removal is gated on the whole snapshot: a cluster_id reported
+    running anywhere keeps its entry, whatever the precheck concluded about the
+    sources.
+- `sparkrun logs <cluster_id>` now falls back to the `sparkrun.runtime`
+  container label (surfaced by `query_status` as
+  `RunningWorkload.runtime_name`) when the job-metadata cache cannot name the
+  runtime. A live workload launched from another control machine — or one whose
+  cache entry was lost — is readable again instead of being unaddressable by id.
+  This also restores useful `logs`/`stop` tab completion for those workloads,
+  which is populated from the same cache.
+
 ## [0.3.0] — 2026-07-30
 
 The largest release since 0.1: multiplatform foundations, a console-free
