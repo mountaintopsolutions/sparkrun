@@ -140,7 +140,12 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
   leniently: a snapshot written by an earlier sparkrun (or one whose
   `workloads` block is unreadable) keeps its running set and simply has no
   descriptions, because discarding the set over a missing annotation would put
-  every dead job back in the list.
+  every dead job back in the list. A recipe ref that is a path to a YAML file
+  is annotated by its stem: the ref records whatever the launch was handed, so
+  a job started from a laptop carries that laptop's absolute path, and the
+  directory layout is not what identifies the recipe. Bare names and
+  `@registry/name` refs are left alone — both are values a user can type, and
+  rewriting them in the annotation would misrepresent what to type.
 
 ### Changed
 
