@@ -766,9 +766,105 @@ class TestRunningSnapshot:
         from sparkrun.orchestration.job_metadata import load_running_snapshot, save_running_snapshot
 
         save_running_snapshot({"sparkrun_a_b"}, ["h1", "h2"], cache_dir=str(tmp_path))
-        running, covered = load_running_snapshot(cache_dir=str(tmp_path))
-        assert running == {"sparkrun_a_b"}
-        assert covered == {"h1", "h2"}
+        snap = load_running_snapshot(cache_dir=str(tmp_path))
+        assert snap.running == {"sparkrun_a_b"}
+        assert snap.covered == {"h1", "h2"}
+
+    def test_observed_workloads_round_trip(self, tmp_path):
+        """Labels the sweep already saw, carried so completion can describe them.
+
+        ``query_status`` recovers recipe / runtime from container labels. A
+        workload with no cached job metadata is otherwise a bare hex digest in
+        the completion list — exactly the case where a description is worth
+        most.
+        """
+        from sparkrun.orchestration.job_metadata import (
+            ObservedWorkload,
+            load_running_snapshot,
+            save_running_snapshot,
+        )
+
+        save_running_snapshot(
+            {"sparkrun_a_b"},
+            ["h1", "h2"],
+            workloads=[ObservedWorkload(cluster_id="sparkrun_a_b", recipe="qwen-fp8", runtime="sglang", hosts=("h1",))],
+            cache_dir=str(tmp_path),
+        )
+        seen = load_running_snapshot(cache_dir=str(tmp_path)).workloads["sparkrun_a_b"]
+        assert (seen.recipe, seen.runtime, seen.hosts) == ("qwen-fp8", "sglang", ("h1",))
+
+    def test_snapshot_predating_workloads_reads_as_unlabelled(self, tmp_path):
+        """An upgrade must not invalidate the snapshot already on disk.
+
+        The file is written by whichever sparkrun swept last, so a reader will
+        routinely meet one with no ``workloads`` key. Discarding the running
+        set over a missing description would put every dead job straight back
+        into the completion list.
+        """
+        import json
+        import time
+
+        from sparkrun.orchestration.job_metadata import RUNNING_SNAPSHOT_FILE, load_running_snapshot
+
+        (tmp_path / RUNNING_SNAPSHOT_FILE).write_text(json.dumps({"at": time.time(), "cluster_ids": ["sparkrun_a_b"], "hosts": ["h1"]}))
+        snap = load_running_snapshot(cache_dir=str(tmp_path))
+        assert snap.running == {"sparkrun_a_b"}
+        assert snap.covered == {"h1"}
+        assert snap.workloads == {}
+
+    def test_labels_for_unlisted_ids_are_dropped_on_read_too(self, tmp_path):
+        """The invariant is ``workloads`` ⊆ ``running``, held at the boundary.
+
+        The write side already enforces it, but the file is user-writable and
+        may have been produced by another version, so a reader that trusted it
+        would hand consumers a label for something it never said was running.
+        Re-applying the guard here is what lets a consumer iterate
+        ``.workloads`` instead of ``.running`` without being wrong.
+        """
+        import json
+        import time
+
+        from sparkrun.orchestration.job_metadata import RUNNING_SNAPSHOT_FILE, load_running_snapshot
+
+        (tmp_path / RUNNING_SNAPSHOT_FILE).write_text(
+            json.dumps(
+                {
+                    "at": time.time(),
+                    "cluster_ids": ["sparkrun_a_b"],
+                    "hosts": ["h1"],
+                    "workloads": {
+                        "sparkrun_a_b": {"recipe": "here"},
+                        "sparkrun_c_d": {"recipe": "never-reported-running"},
+                    },
+                }
+            )
+        )
+        assert set(load_running_snapshot(cache_dir=str(tmp_path)).workloads) == {"sparkrun_a_b"}
+
+    def test_labels_for_unlisted_ids_are_dropped(self, tmp_path):
+        """``cluster_ids`` stays the authoritative running set.
+
+        Descriptions hang off it; a label for something the sweep did not
+        report running must not smuggle that id back in.
+        """
+        from sparkrun.orchestration.job_metadata import (
+            ObservedWorkload,
+            load_running_snapshot,
+            save_running_snapshot,
+        )
+
+        save_running_snapshot(
+            {"sparkrun_a_b"},
+            ["h1"],
+            workloads=[
+                ObservedWorkload(cluster_id="sparkrun_a_b", recipe="here"),
+                ObservedWorkload(cluster_id="sparkrun_c_d", recipe="not-running"),
+            ],
+            cache_dir=str(tmp_path),
+        )
+        snap = load_running_snapshot(cache_dir=str(tmp_path))
+        assert snap.running == {"sparkrun_a_b"}
+        assert set(snap.workloads) == {"sparkrun_a_b"}
 
     def test_absent_snapshot_is_none(self, tmp_path):
         from sparkrun.orchestration.job_metadata import load_running_snapshot

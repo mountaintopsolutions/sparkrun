@@ -130,6 +130,29 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
   cache entry was lost — is readable again instead of being unaddressable by id.
   This also restores useful `logs`/`stop` tab completion for those workloads,
   which is populated from the same cache.
+- `logs`/`stop` completion now describes a running workload that has no cached
+  job metadata, instead of offering a bare hex cluster_id. The status sweep
+  already recovers recipe and runtime from the `sparkrun.recipe` /
+  `sparkrun.runtime` container labels, so `running.json` carries them under a
+  new `workloads` key and completion renders `recipe runtime on host` as the
+  item's help — on zsh and fish, which display it; bash discards help text, so
+  the value still has to stand alone there. The key is additive and read
+  leniently: a snapshot written by an earlier sparkrun (or one whose
+  `workloads` block is unreadable) keeps its running set and simply has no
+  descriptions, because discarding the set over a missing annotation would put
+  every dead job back in the list.
+
+### Changed
+
+- `load_running_snapshot` returns a `RunningSnapshot` dataclass
+  (`running` / `covered` / `workloads`) rather than a
+  `(cluster_ids, hosts_covered)` tuple. Adding the third field to a tuple would
+  have silently broken every `running, covered = …` destructure, and two
+  positional frozensets are easy to transpose. `save_running_snapshot` grows a
+  keyword-only `workloads=` argument; its positional signature is unchanged.
+  New `ObservedWorkload` record and `observe_workloads()` fold, shared by
+  `api.status` and completion's own sweep so the two cannot describe the same
+  workload differently.
 
 ## [0.3.0] — 2026-07-30
 

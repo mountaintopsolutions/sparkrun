@@ -413,13 +413,18 @@ class TestLiveStatusCompletion:
         )
 
         def _install(running, errors=None):
+            """*running* maps host → ids, each a plain cluster_id or (cid, recipe, runtime)."""
             from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+
+            def _workload(spec):
+                if isinstance(spec, str):
+                    return RunningWorkload(cluster_id=spec)
+                cid, recipe_name, runtime_name = spec
+                return RunningWorkload(cluster_id=cid, recipe_name=recipe_name, runtime_name=runtime_name)
 
             errors = errors or {}
             hosts = tuple(
-                HostOccupancy(host=h, workloads=tuple(RunningWorkload(cluster_id=c) for c in running.get(h, ())))
-                for h in ("h1", "h2")
-                if h not in errors
+                HostOccupancy(host=h, workloads=tuple(_workload(c) for c in running.get(h, ()))) for h in ("h1", "h2") if h not in errors
             )
             calls: list = []
 
@@ -449,6 +454,32 @@ class TestLiveStatusCompletion:
         live({"h1": ["sparkrun_aaaaaaaaaaaa", "sparkrun_cccccccccccc"]})
 
         assert {i.value for i in _complete_targets("")} == {"known", "sparkrun_cccccccccccc"}
+
+    def test_running_workload_without_metadata_is_described(self, jobs_cache: Path, live):
+        """The bare hex digest is the one completion nobody can read.
+
+        Its containers carry ``sparkrun.recipe`` / ``sparkrun.runtime`` labels
+        and the sweep already surfaced them, so the description costs nothing
+        beyond passing it along. zsh and fish render it; bash discards help
+        text entirely, which is why the *value* still has to stand alone.
+        """
+        live({"h1": [("sparkrun_cccccccccccc", "qwen-fp8", "sglang")]})
+
+        (item,) = _complete_targets("")
+        assert item.value == "sparkrun_cccccccccccc"
+        assert item.help == "qwen-fp8 sglang on h1"
+
+    def test_unlabelled_workload_is_offered_without_a_description(self, jobs_cache: Path, live):
+        """Containers predating label emission have nothing to say.
+
+        An empty help string is the sentinel zsh's ``_describe`` expects; a
+        half-built one ("on h1" with no name) would be worse than none.
+        """
+        live({"h1": ["sparkrun_cccccccccccc"]})
+
+        (item,) = _complete_targets("")
+        assert item.value == "sparkrun_cccccccccccc"
+        assert not item.help
 
     def test_sweep_is_bounded_by_a_timeout(self, jobs_cache: Path, live):
         """The one hard limit on how long a TAB can take."""
@@ -647,6 +678,57 @@ class TestCompletionSnapshotReuse:
         assert calls, "ttl=0 must sweep every time"
 
 
+def test_cached_snapshot_still_describes_an_uncached_workload(jobs_cache: Path, default_cluster):
+    """The reason the labels go to disk rather than staying in the sweep.
+
+    With a 60s TTL the cached path is the common one, so descriptions that
+    only existed on the live path would rarely be seen.
+    """
+    from sparkrun.orchestration.job_metadata import ObservedWorkload, save_running_snapshot
+
+    save_running_snapshot(
+        {"sparkrun_cccccccccccc"},
+        ["h1"],
+        workloads=[ObservedWorkload(cluster_id="sparkrun_cccccccccccc", recipe="qwen-fp8", runtime="sglang", hosts=("h1",))],
+        cache_dir=str(jobs_cache.parent),
+    )
+
+    (item,) = _complete_targets("")
+    assert item.value == "sparkrun_cccccccccccc"
+    assert item.help == "qwen-fp8 sglang on h1"
+
+
+def test_status_records_workload_labels_for_completion(tmp_path, monkeypatch):
+    """The labels reach the snapshot from a real ``docker ps`` parse.
+
+    Hand-built ``ClusterStatus`` fixtures can't show that the executor
+    actually populates ``recipe_name`` / ``runtime_name`` from the container
+    labels sparkrun emits — and the description is worthless if it doesn't.
+    """
+    import sparkrun.core.config as _config_module
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.orchestration.job_metadata import load_running_snapshot
+    from sparkrun.orchestration.ssh import RemoteResult
+
+    monkeypatch.setattr(_config_module, "DEFAULT_CACHE_DIR", tmp_path, raising=False)
+
+    import sparkrun.api as api
+
+    cid = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    ps = (
+        '{"Names":"%s_solo","Status":"Up 1 min","Image":"img","ID":"x",'
+        '"Labels":"sparkrun.cluster_id=%s,sparkrun.recipe=qwen-fp8,sparkrun.runtime=sglang"}' % (cid, cid)
+    )
+    with mock.patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=[RemoteResult(host="h1", returncode=0, stdout=ps, stderr="")],
+    ):
+        api.status(["h1"], cluster=ClusterDefinition(name="c", hosts=["h1"]))
+
+    seen = load_running_snapshot(cache_dir=str(tmp_path)).workloads[cid]
+    assert (seen.recipe, seen.runtime, seen.hosts) == ("qwen-fp8", "sglang", ("h1",))
+
+
 def test_status_records_the_snapshot_for_completion(tmp_path, monkeypatch):
     """``api.status`` is the choke point every sweep passes through.
 
@@ -672,7 +754,8 @@ def test_status_records_the_snapshot_for_completion(tmp_path, monkeypatch):
     ):
         api.status(["h1", "h2"], cluster=ClusterDefinition(name="c", hosts=["h1", "h2"]))
 
-    running, covered = load_running_snapshot(cache_dir=str(tmp_path))
+    snap = load_running_snapshot(cache_dir=str(tmp_path))
+    running, covered = snap.running, snap.covered
     assert "sparkrun_aaaaaaaaaaaaaaaa_111111111111" in running
     # h2 failed, so it is not claimed as observed — otherwise a reader would
     # conclude "nothing running there" about a host nobody could reach.

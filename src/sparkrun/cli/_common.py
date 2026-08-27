@@ -870,18 +870,36 @@ def _is_cluster_id(value: str) -> str | None:
 def _describe_job(job) -> str:
     """Render a one-line description for a :class:`~sparkrun.api.JobInfo`.
 
-    Used as the ``description`` on :class:`CompletionItem` instances so
-    shells that render it (zsh, fish) show recipe + runtime + hosts
-    alongside the cluster_id.
+    Used as the ``help`` on :class:`CompletionItem` instances so shells that
+    render it (zsh, fish) show recipe + runtime + hosts alongside the
+    cluster_id.  Bash discards help text entirely, which is why the *value*
+    still has to stand on its own.
+    """
+    return _describe(job.recipe, job.runtime, job.hosts)
+
+
+def _describe(recipe: str | None, runtime: str | None, hosts) -> str:
+    """The one description format, shared by cached jobs and observed ones.
+
+    Two sources answer the same question — a :class:`~sparkrun.api.JobInfo`
+    from the metadata cache, an
+    :class:`~sparkrun.orchestration.job_metadata.ObservedWorkload` from the
+    status sweep — and a completion list that formatted them differently would
+    look like it was offering two kinds of thing.
+
+    Returns ``""`` when nothing is known: an empty help is the sentinel zsh's
+    ``_describe`` expects, and a fragment like "on h1" with no name attached
+    is worse than no annotation at all.
     """
     parts = []
-    if job.recipe:
-        parts.append(job.recipe)
-    if job.runtime:
-        parts.append(job.runtime)
-    if job.hosts:
-        parts.append("on " + ",".join(job.hosts))
-    return " ".join(parts) if parts else ""
+    if recipe:
+        parts.append(recipe)
+    if runtime:
+        parts.append(runtime)
+    if recipe or runtime:
+        if hosts:
+            parts.append("on " + ",".join(hosts))
+    return " ".join(parts)
 
 
 #: How many cached jobs completion considers.  Bounds both the YAML parsing
@@ -975,11 +993,15 @@ def _complete_targets(incomplete: str, ctx=None):
         # A workload the cluster reports running but the local cache has no
         # metadata for — launched from another machine, or pruned — is still
         # addressable by id, and is exactly what the user is reaching for.
+        # The sweep saw its container labels, so it can be described even
+        # though nothing local knows what it is.
         if snapshot is not None:
-            for cid in sorted(snapshot[0] - offered_ids):
+            for cid in sorted(snapshot.running - offered_ids):
                 digest = cid.removeprefix("sparkrun_")
                 if cid.startswith(incomplete) or digest.startswith(incomplete):
-                    items.append(click.shell_completion.CompletionItem(cid))
+                    seen = snapshot.workloads.get(cid)
+                    help_text = _describe(seen.recipe, seen.runtime, seen.hosts) if seen else ""
+                    items.append(click.shell_completion.CompletionItem(cid, help=help_text))
         return items
     except Exception:  # noqa: BLE001 — completion must never crash; degrade to empty list
         return []
@@ -1006,16 +1028,17 @@ def _completion_running(cluster_def):
     whole path exists to eliminate.  The longer window is still honoured as a
     *fallback* when a live sweep fails: stale information beats none.
 
-    Returns ``(running_cluster_ids, hosts_covered)``, or ``None`` for "could
-    not establish", which callers must treat as "show everything".  Hosts the
-    sweep failed to reach are excluded from the covered set, so a workload on
-    an unreachable host reads as unknown rather than dead.
+    Returns a
+    :class:`~sparkrun.orchestration.job_metadata.RunningSnapshot`, or ``None``
+    for "could not establish", which callers must treat as "show everything".
+    Hosts the sweep failed to reach are excluded from the covered set, so a
+    workload on an unreachable host reads as unknown rather than dead.
     """
-    from sparkrun.orchestration.job_metadata import load_running_snapshot
+    from sparkrun.orchestration.job_metadata import RunningSnapshot, load_running_snapshot, observe_workloads
 
     target = set(getattr(cluster_def, "hosts", ()) or ())
     cached = load_running_snapshot(max_age_s=_completion_cache_ttl())
-    if cached is not None and target and target <= cached[1]:
+    if cached is not None and target and target <= cached.covered:
         return cached
 
     timeout = _completion_status_timeout()
@@ -1035,9 +1058,15 @@ def _completion_running(cluster_def):
 
             hosts = list(cluster_def.hosts)
             status = api.status(hosts, cluster=cluster_def, ssh_kwargs=ssh_kwargs)
-            running = {w.cluster_id for entry in status.hosts for w in entry.workloads if w.cluster_id}
-            covered = frozenset(h for h in hosts if h not in status.errors)
-            return frozenset(running), covered
+            # Same fold ``api.status`` just recorded to disk, applied to the
+            # snapshot in hand — reading the file back would work too, but
+            # would make this path depend on that write having succeeded.
+            observed = observe_workloads(status)
+            return RunningSnapshot(
+                running=frozenset(w.cluster_id for w in observed),
+                covered=frozenset(h for h in hosts if h not in status.errors),
+                workloads={w.cluster_id: w for w in observed},
+            )
         except Exception:
             logger.debug("Completion status query failed; falling back to the cached snapshot", exc_info=True)
 
@@ -1100,13 +1129,12 @@ def _job_is_live(job, snapshot, target_hosts: "set[str] | None" = None) -> bool:
     """
     if snapshot is None:
         return True
-    running, covered = snapshot
-    if job.cluster_id in running:
+    if job.cluster_id in snapshot.running:
         return True
     hosts = set(job.hosts or ())
     if target_hosts and hosts and not (hosts & target_hosts):
         return False
-    return not (hosts and hosts <= covered)
+    return not (hosts and hosts <= snapshot.covered)
 
 
 def _completion_cluster(ctx=None):
