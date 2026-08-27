@@ -469,6 +469,20 @@ class TestLiveStatusCompletion:
         assert item.value == "sparkrun_cccccccccccc"
         assert item.help == "qwen-fp8 sglang on h1"
 
+    def test_a_path_recipe_is_described_by_its_stem(self, jobs_cache: Path, live):
+        """Recipe refs are routinely absolute paths — on another machine.
+
+        ``sparkrun.recipe`` records whatever the launch was given, so a job
+        started from a laptop carries something like
+        ``/Users/x/github/cluster-testing/ornith-9b-int4.yaml``. Rendered
+        whole that is sixty characters of another host's directory layout in
+        a completion column; the stem is the part that identifies it.
+        """
+        live({"h1": [("sparkrun_cccccccccccc", "/Users/x/github/cluster-testing/ornith-9b-int4.yaml", "vllm-distributed")]})
+
+        (item,) = _complete_targets("")
+        assert item.help == "ornith-9b-int4 vllm-distributed on h1"
+
     def test_unlabelled_workload_is_offered_without_a_description(self, jobs_cache: Path, live):
         """Containers predating label emission have nothing to say.
 
@@ -676,6 +690,29 @@ class TestCompletionSnapshotReuse:
 
         _complete_targets("")
         assert calls, "ttl=0 must sweep every time"
+
+
+@pytest.mark.parametrize(
+    "ref,expected",
+    [
+        ("qwen3.5-27b-fp8-sglang", "qwen3.5-27b-fp8-sglang"),
+        ("@atlas/qwen3.5-27b-fp8", "@atlas/qwen3.5-27b-fp8"),
+        ("/Users/x/github/testing/ornith-9b-int4.yaml", "ornith-9b-int4"),
+        ("/tmp/opencode/flux2-dev-torchao-nvfp4.yml", "flux2-dev-torchao-nvfp4"),
+        ("recipes/qwen.yaml", "qwen"),
+        ("https://spark-arena.com/api/recipes/abc123/raw", "@spark-arena/abc123"),
+    ],
+)
+def test_display_recipe_ref(ref, expected):
+    """Only a path to a YAML file is shortened.
+
+    A bare name and an ``@registry/name`` are already the shortest thing that
+    identifies the recipe — and both are values a user can type, so silently
+    rewriting either in the annotation would misrepresent what to type.
+    """
+    from sparkrun.cli._common import _display_recipe_ref
+
+    assert _display_recipe_ref(ref) == expected
 
 
 def test_cached_snapshot_still_describes_an_uncached_workload(jobs_cache: Path, default_cluster):

@@ -893,13 +893,42 @@ def _describe(recipe: str | None, runtime: str | None, hosts) -> str:
     """
     parts = []
     if recipe:
-        parts.append(recipe)
+        parts.append(_display_recipe_ref(recipe))
     if runtime:
         parts.append(runtime)
     if recipe or runtime:
         if hosts:
             parts.append("on " + ",".join(hosts))
     return " ".join(parts)
+
+
+def _display_recipe_ref(ref: str | None) -> str:
+    """Shorten a recipe reference for an annotation column.
+
+    A recipe ref is whatever the launch was handed, and for a job started from
+    a path that is an absolute path *on the machine that launched it* — the
+    container label happily records ``/Users/x/github/cluster-testing/foo.yaml``
+    and a completion list then shows sixty characters of somebody else's
+    directory layout. The stem is the part that identifies the recipe.
+
+    Only a path to a YAML file is touched. A bare name and an
+    ``@registry/name`` are already minimal, and both are values a user can
+    type, so rewriting either in the annotation would misrepresent what to
+    type. URLs go through :func:`simplify_recipe_ref`, which turns the
+    spark-arena form into its ``@spark-arena/<id>`` shortcut.
+
+    Display only — never applied to a :class:`CompletionItem`'s *value*, which
+    has to stay something ``logs`` / ``stop`` can resolve.
+    """
+    if not ref:
+        return ""
+    if _is_recipe_url(ref):
+        return _simplify_recipe_ref(ref)
+    stem = ref.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    for suffix in (".yaml", ".yml"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return ref
 
 
 #: How many cached jobs completion considers.  Bounds both the YAML parsing
