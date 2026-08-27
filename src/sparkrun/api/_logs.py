@@ -16,6 +16,7 @@ raises here rather than on the first ``next()``); only the reading is lazy.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator
 
 from sparkrun.api._errors import JobNotFound, SparkrunError
@@ -128,7 +129,6 @@ def logs(
         cluster_def = resolve_cluster(cluster, target_hosts, sctx=sctx)
         prepare_transport(cluster_def)
 
-    runtime = _resolve_runtime_for_job(meta, cluster_id, recipe=resolved_recipe, sctx=sctx)
     executor = resolve_executor(
         cluster=cluster_def,
         cli_overrides=_executor_overrides_from_meta(meta),
@@ -144,14 +144,27 @@ def logs(
         except Exception:
             logger.debug("Failed to apply cluster SSH user", exc_info=True)
 
-    sources = runtime.log_sources(
+    ssh_kwargs = build_ssh_kwargs(config) if config else {}
+
+    # One status sweep, taken before the sources are named rather than after.
+    # It answers two questions the naming depends on — where this workload
+    # actually runs, and (when the metadata cache can't) which runtime it was
+    # launched with — and is then handed to the liveness precheck so the sweep
+    # is still paid for exactly once.
+    snapshot = _query_status(executor, target_hosts, ssh_kwargs)
+    observed = _observe_placement(snapshot, cluster_id)
+
+    runtime = _resolve_runtime_for_job(
+        meta,
         cluster_id,
-        target_hosts,
-        is_solo=len(target_hosts) <= 1,
-        scope=scope,
+        recipe=resolved_recipe,
+        observed=observed,
+        sctx=sctx,
     )
 
-    ssh_kwargs = build_ssh_kwargs(config) if config else {}
+    source_hosts, is_solo = _hosts_for_sources(observed, meta, target_hosts, discovered_by_recipe=resolved_recipe is not None)
+
+    sources = runtime.log_sources(cluster_id, source_hosts, is_solo=is_solo, scope=scope)
 
     # Liveness precheck: check ALL nodes (not just the head log source) —
     # in a multi-node job the head may have crashed while workers are still
@@ -162,17 +175,8 @@ def logs(
     #
     # Substrate knowledge stays behind the executor throughout: this module
     # asks *what is running* and *what became of it*, never *how to look*.
-    all_sources = (
-        sources
-        if scope == SCOPE_ALL
-        else runtime.log_sources(
-            cluster_id,
-            target_hosts,
-            is_solo=len(target_hosts) <= 1,
-            scope=SCOPE_ALL,
-        )
-    )
-    _verify_log_source_alive(executor, all_sources, ssh_kwargs, cluster_id, cache_dir, scope=scope)
+    all_sources = sources if scope == SCOPE_ALL else runtime.log_sources(cluster_id, source_hosts, is_solo=is_solo, scope=SCOPE_ALL)
+    _verify_log_source_alive(executor, all_sources, ssh_kwargs, cluster_id, cache_dir, scope=scope, snapshot=snapshot)
 
     return read_log_sources(
         executor,
@@ -183,8 +187,132 @@ def logs(
     )
 
 
+@dataclass(frozen=True)
+class _ObservedPlacement:
+    """Where a workload is *actually* running, per the status snapshot.
+
+    The counterpart to what the caller *asked about*: a cluster's host list, or
+    the hosts a launch recorded.  Those two can disagree with reality — the
+    common case being a solo workload occupying one host of a many-host
+    cluster — and when they do it is this that must win, because the container
+    names follow the real deployment.
+    """
+
+    hosts: tuple[str, ...]
+    """Hosts the workload occupies, in the order they were queried."""
+
+    roles: tuple[str, ...]
+    """Container roles observed across those hosts (``solo``, ``head``, ``node_1``, …)."""
+
+    runtime_name: str | None
+    """Runtime recovered from the ``sparkrun.runtime`` container label, if emitted."""
+
+    @property
+    def is_solo(self) -> bool:
+        """True when the workload is one lone ``_solo`` container.
+
+        Deliberately strict: anything else — several containers, an
+        unnamed-role executor, a partially-dead multi-node job — keeps the
+        declared placement, so this can only ever *correct* the solo case and
+        never reshuffle a rank→host mapping.
+        """
+        return self.roles == ("solo",)
+
+
+def _query_status(executor, hosts: list[str], ssh_kwargs: dict):
+    """One best-effort status sweep; ``None`` when it could not be taken.
+
+    Every consumer of the result treats ``None`` as "cannot tell" and falls
+    back to the declared placement, so a broken or unreachable substrate
+    degrades ``logs`` to its pre-snapshot behaviour rather than failing it.
+    """
+    if not hosts:
+        return None
+    try:
+        return executor.query_status(list(hosts), ssh_kwargs=ssh_kwargs)
+    except Exception:  # noqa: BLE001 — best-effort; let the log reader surface its own error
+        logger.debug("Status sweep failed while resolving log sources", exc_info=True)
+        return None
+
+
+def _observe_placement(snapshot, cluster_id: str) -> "_ObservedPlacement | None":
+    """Extract *cluster_id*'s real placement from a status snapshot.
+
+    ``None`` when there is no snapshot, or the workload does not appear in it —
+    both of which mean "no observation", not "not running".  Only
+    :func:`_verify_log_source_alive` is entitled to turn an absence into a
+    verdict, and it has the executor's post-mortem probe to do it with.
+    """
+    if snapshot is None:
+        return None
+    hosts: list[str] = []
+    roles: list[str] = []
+    runtime_name: str | None = None
+    for entry in getattr(snapshot, "hosts", ()) or ():
+        for workload in entry.workloads:
+            if workload.cluster_id != cluster_id:
+                continue
+            hosts.append(entry.host)
+            roles.extend(c.role for c in workload.containers)
+            runtime_name = runtime_name or workload.runtime_name
+    if not hosts:
+        return None
+    return _ObservedPlacement(hosts=tuple(hosts), roles=tuple(roles), runtime_name=runtime_name)
+
+
+def _hosts_for_sources(
+    observed: "_ObservedPlacement | None",
+    meta: dict | None,
+    target_hosts: list[str],
+    *,
+    discovered_by_recipe: bool,
+) -> tuple[list[str], bool]:
+    """The hosts the log sources are named for, and whether this is a solo job.
+
+    Not the same question as "which hosts did the caller point us at".  The
+    caller's hosts are a *search scope*; the container names come from the
+    workload's own placement, and reading one for the other is what asked for
+    ``{cid}_node_0`` on a job whose only container is ``{cid}_solo``.
+
+    Three sources, most authoritative first:
+
+    1. **The live snapshot**, when it shows a lone ``_solo`` container. Reality
+       outranks everything, and this is the one shape it can correct without
+       risking a rank→host reshuffle (see :attr:`_ObservedPlacement.is_solo`).
+    2. **The launch's recorded hosts**, for the recipe form only. There the
+       caller never named hosts to read — the cluster list exists solely to
+       scope discovery — so the metadata is strictly better information. The
+       cluster_id form keeps honouring an explicit ``hosts=`` argument, which
+       is the documented way to correct stale or wrong metadata.
+    3. **The caller's hosts**, unchanged, when nothing better is known.
+    """
+    if observed is not None and observed.is_solo:
+        return [observed.hosts[0]], True
+    if discovered_by_recipe and meta and meta.get("hosts"):
+        declared = [str(h) for h in meta["hosts"]]
+        return declared, len(declared) <= 1
+    return list(target_hosts), len(target_hosts) <= 1
+
+
+def _covers(snapshot, hosts) -> bool:
+    """Whether *snapshot* has something to say about every one of *hosts*.
+
+    A host that was swept but unreachable counts as covered — ``errors`` is an
+    answer ("we looked and could not tell"), whereas a host that was never in
+    the sweep's scope is not.
+    """
+    known = {entry.host for entry in getattr(snapshot, "hosts", ()) or ()}
+    known.update(getattr(snapshot, "errors", None) or {})
+    return all(h in known for h in hosts)
+
+
+def _is_running_anywhere(snapshot, cluster_id: str) -> bool:
+    """Whether *cluster_id* appears as running anywhere in *snapshot*."""
+    return _observe_placement(snapshot, cluster_id) is not None
+
+
 def _verify_log_source_alive(
-    executor, sources, ssh_kwargs: dict, cluster_id: str, cache_dir: str | None, *, scope: str = SCOPE_HEAD
+    executor, sources, ssh_kwargs: dict, cluster_id: str, cache_dir: str | None, *, scope: str = SCOPE_HEAD, snapshot=None
 ) -> None:
     """Raise :class:`JobNotFound` if the workload isn't running.
 
@@ -214,6 +342,12 @@ def _verify_log_source_alive(
     Best-effort: if the status query fails or a host is unreachable
     (in ``ClusterStatus.errors``), the precheck is skipped so a network
     blip never causes a false "not running" verdict.
+
+    Args:
+        snapshot: A sweep the caller already paid for. Reused when it covers
+            every source host; otherwise a fresh one is taken, so a source
+            outside the swept scope is still checked rather than silently
+            reported as unobserved.
     """
     if not sources:
         return
@@ -223,31 +357,32 @@ def _verify_log_source_alive(
     # One parallel SSH sweep via the status API — same source of truth
     # as `api.status`, `check_job_running`, and the monitor TUI.
     all_hosts = list(dict.fromkeys(s.host for s in sources))
-    try:
-        snapshot = executor.query_status(all_hosts, ssh_kwargs=ssh_kwargs)
-    except Exception:  # noqa: BLE001 — best-effort; let log reader surface its own error
-        return
+    if snapshot is None or not _covers(snapshot, all_hosts):
+        try:
+            snapshot = executor.query_status(all_hosts, ssh_kwargs=ssh_kwargs)
+        except Exception:  # noqa: BLE001 — best-effort; let log reader surface its own error
+            return
 
     def _container_status(host: str, container_name: str) -> bool | None:
-        """True if running, False if confirmed absent, None if host unreachable."""
+        """True if running, False if confirmed absent, None if inconclusive."""
         occ = snapshot.for_host(host)
         if occ is None:
             return None  # host in errors / unreachable → inconclusive
         for w in occ.workloads:
-            if w.cluster_id == cluster_id:
-                for c in w.containers:
-                    if c.name == container_name:
-                        return True
-                # The cluster_id is here but this container isn't named.
-                # ``RunningWorkload.containers`` is optional — an executor that
-                # doesn't populate it can't answer per-container questions at
-                # all, so this is *inconclusive*, not "alive".  The difference
-                # only shows on workers: counting one alive by mistake reports
-                # "partially running, try --all-sources" for a workload that is
-                # entirely dead.
-                if not w.containers:
-                    return None
-        return False  # host reachable, container not in snapshot
+            if w.cluster_id != cluster_id:
+                continue
+            if any(c.name == container_name for c in w.containers):
+                return True
+            # The workload is on this host, but not under the name we asked
+            # about — either because it has none to report
+            # (``RunningWorkload.containers`` is optional, so an executor that
+            # doesn't populate it cannot answer per-container questions at
+            # all) or because we named it wrongly, as reading a solo job with
+            # the cluster's host count does.  Neither is evidence that it
+            # stopped, and calling it dead here is what deleted a *live*
+            # workload's job metadata further down.
+            return None
+        return False  # host reachable, workload not on it at all
 
     head_status = _container_status(head.host, head.container)
     if head_status is None:
@@ -301,12 +436,18 @@ def _verify_log_source_alive(
 
     # Confirmed gone — the cached metadata is stale.  Remove it so
     # ``logs <TAB>`` stops suggesting this dead workload.
-    try:
-        from sparkrun.orchestration.job_metadata import remove_job_metadata
+    #
+    # Guarded on the whole snapshot, not just on the sources: metadata is
+    # load-bearing (``stop``, ``logs`` by id, and proxy discovery all read it,
+    # and only a relaunch can put it back), so a workload the cluster reports
+    # running keeps its entry even when we failed to name its containers.
+    if not _is_running_anywhere(snapshot, cluster_id):
+        try:
+            from sparkrun.orchestration.job_metadata import remove_job_metadata
 
-        remove_job_metadata(cluster_id, cache_dir=cache_dir)
-    except Exception:
-        logger.debug("Failed to remove stale metadata for %s", cluster_id, exc_info=True)
+            remove_job_metadata(cluster_id, cache_dir=cache_dir)
+        except Exception:
+            logger.debug("Failed to remove stale metadata for %s", cluster_id, exc_info=True)
 
     raise JobNotFound(
         "Workload %s is not running on %s and nothing remains to read%s.\n"
@@ -335,7 +476,14 @@ def _hint_block(info) -> str:
     return "\n" + "\n".join("  %s" % h for h in hints)
 
 
-def _resolve_runtime_for_job(meta: dict | None, cluster_id: str, *, recipe=None, sctx: "SparkrunContext | None"):
+def _resolve_runtime_for_job(
+    meta: dict | None,
+    cluster_id: str,
+    *,
+    recipe=None,
+    observed: "_ObservedPlacement | None" = None,
+    sctx: "SparkrunContext | None",
+):
     """Resolve the runtime that owns this workload's logs.
 
     The runtime is what knows where its logs live, so getting this right is
@@ -345,15 +493,21 @@ def _resolve_runtime_for_job(meta: dict | None, cluster_id: str, *, recipe=None,
     Guessing wrong yields "No such container" or an empty stream — which is
     exactly what the previous hardcoded implementation did.
 
-    Prefers the *recipe* when the caller addressed the workload by one: the
-    recipe carries the runtime directly, so the recipe form keeps working
-    even when the job-metadata cache is missing (a job launched from another
-    control machine, or a cleared cache).  Falls back to metadata for the
-    cluster_id form, where the recipe isn't known.
+    Three sources, in descending order of directness:
+
+    1. The *recipe*, when the caller addressed the workload by one — it
+       carries the runtime outright.
+    2. The job metadata recorded at launch, for the cluster_id form.
+    3. The running container's ``sparkrun.runtime`` label, surfaced by
+       ``query_status`` as
+       :attr:`~sparkrun.core.cluster_status.RunningWorkload.runtime_name`.
+       This is what keeps a live workload readable when the metadata cache
+       cannot answer — a job launched from another control machine, a pruned
+       or lost cache — instead of stranding it until relaunch.
     """
     from sparkrun.core.bootstrap import get_runtime
 
-    runtime_name = getattr(recipe, "runtime", None) or (meta or {}).get("runtime")
+    runtime_name = getattr(recipe, "runtime", None) or (meta or {}).get("runtime") or getattr(observed, "runtime_name", None)
     if not runtime_name:
         raise JobNotFound(
             "No job metadata (or no runtime recorded) for cluster_id %r, so sparkrun can't tell where "

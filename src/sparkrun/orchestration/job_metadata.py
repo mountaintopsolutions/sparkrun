@@ -670,10 +670,77 @@ RUNNING_SNAPSHOT_FILE = "running.json"
 RUNNING_SNAPSHOT_MAX_AGE_S = 600
 
 
+@dataclass(frozen=True)
+class ObservedWorkload:
+    """What a sweep could say about one running workload, beyond its id.
+
+    Recovered from the container labels sparkrun emits (``sparkrun.recipe`` /
+    ``sparkrun.runtime``), so it is available for workloads this control
+    machine has no job metadata for — launched elsewhere, or pruned.  Every
+    field but ``cluster_id`` is optional: containers predating label emission
+    carry none, and a half-known workload is still worth recording.
+    """
+
+    cluster_id: str
+    recipe: str | None = None
+    runtime: str | None = None
+    hosts: tuple[str, ...] = ()
+
+
+def observe_workloads(status) -> "list[ObservedWorkload]":
+    """Fold a :class:`~sparkrun.core.cluster_status.ClusterStatus` into label records.
+
+    One entry per cluster_id, gathering the hosts it occupies in sweep order.
+    Shared by the two places that turn a sweep into a snapshot — ``api.status``
+    recording one, and completion building one from a sweep it took itself — so
+    the two cannot describe the same workload differently.
+
+    Duck-typed on ``.hosts`` / ``.workloads`` rather than imported, keeping this
+    module free of a dependency on the status dataclasses.
+    """
+    observed: dict[str, ObservedWorkload] = {}
+    for entry in getattr(status, "hosts", ()) or ():
+        for w in entry.workloads:
+            if not w.cluster_id:
+                continue
+            prior = observed.get(w.cluster_id)
+            observed[w.cluster_id] = ObservedWorkload(
+                cluster_id=w.cluster_id,
+                # First non-empty wins: an executor folds a cluster's
+                # containers into one RunningWorkload per host, and only some
+                # of them may carry labels.
+                recipe=(prior.recipe if prior else None) or w.recipe_name,
+                runtime=(prior.runtime if prior else None) or w.runtime_name,
+                hosts=((prior.hosts if prior else ()) + (entry.host,)),
+            )
+    return list(observed.values())
+
+
+@dataclass(frozen=True)
+class RunningSnapshot:
+    """The recorded answer to "what was running, and where did we look?".
+
+    A dataclass rather than the tuple this used to be: the third field would
+    otherwise silently break every ``running, covered = …`` destructure, and
+    the two frozensets are easy to transpose when they are positional.
+    """
+
+    running: frozenset[str]
+    """cluster_ids observed running."""
+
+    covered: frozenset[str]
+    """Hosts the sweep actually reached.  Anything outside this is *unknown*."""
+
+    workloads: "dict[str, ObservedWorkload]" = field(default_factory=dict)
+    """Per-workload labels, keyed by cluster_id.  Decoration — may be empty or
+    partial, and is never the authority on what is running."""
+
+
 def save_running_snapshot(
     cluster_ids: "set[str] | frozenset[str] | tuple[str, ...] | list[str]",
     hosts: "list[str] | tuple[str, ...]",
     *,
+    workloads: "list[ObservedWorkload] | tuple[ObservedWorkload, ...] | None" = None,
     cache_dir: str | None = None,
     sctx: "SparkrunContext | None" = None,
 ) -> None:
@@ -690,17 +757,31 @@ def save_running_snapshot(
     reader cannot distinguish "not running" from "not looked at", and would
     silently hide a live workload on an unswept host.
 
+    *workloads* carries the labels the sweep already saw, so completion can
+    describe a workload with no cached job metadata instead of offering a bare
+    hex digest.  Entries for ids absent from *cluster_ids* are dropped:
+    ``cluster_ids`` stays the single authority on what is running, and a
+    description must not be able to smuggle an id back into that set.
+
     Best-effort and silent on failure: this is a convenience cache, and no
     command should fail because it could not be written.
     """
     import json
 
     cache_dir = _resolve_cache_dir(cache_dir, sctx)
+    running = sorted(str(c) for c in cluster_ids if c)
     payload = {
         "at": time.time(),
-        "cluster_ids": sorted(str(c) for c in cluster_ids if c),
+        "cluster_ids": running,
         "hosts": sorted(str(h) for h in hosts if h),
     }
+    if workloads:
+        known = set(running)
+        observed = {
+            w.cluster_id: {"recipe": w.recipe, "runtime": w.runtime, "hosts": sorted(w.hosts)} for w in workloads if w.cluster_id in known
+        }
+        if observed:
+            payload["workloads"] = observed
     try:
         path = Path(cache_dir)
         path.mkdir(parents=True, exist_ok=True)
@@ -716,16 +797,23 @@ def load_running_snapshot(
     cache_dir: str | None = None,
     max_age_s: float | None = None,
     sctx: "SparkrunContext | None" = None,
-) -> "tuple[frozenset[str], frozenset[str]] | None":
+) -> "RunningSnapshot | None":
     """Read the last observed occupancy snapshot.
 
-    Returns ``(cluster_ids, hosts_covered)``, or ``None`` when there is no
-    snapshot or it is older than *max_age_s* — in which case callers must fall
-    back to showing everything rather than hiding what they cannot vouch for.
+    Returns a :class:`RunningSnapshot`, or ``None`` when there is no snapshot
+    or it is older than *max_age_s* — in which case callers must fall back to
+    showing everything rather than hiding what they cannot vouch for.
 
     *max_age_s* resolves to :data:`RUNNING_SNAPSHOT_MAX_AGE_S` at call time
     rather than binding it as a default, so the module constant is a real knob
     instead of a value frozen when this function was defined.
+
+    The ``workloads`` key is read leniently and independently of the rest: the
+    file on disk was written by whichever sparkrun swept last, which may
+    predate that key or write it in a shape this version does not expect.
+    Losing the running set over an unreadable *description* would put every
+    dead job back into the completion list, so a bad ``workloads`` block costs
+    only the descriptions.
     """
     import json
 
@@ -737,9 +825,34 @@ def load_running_snapshot(
             data = json.load(f)
         if time.time() - float(data["at"]) > max_age_s:
             return None
-        return frozenset(data.get("cluster_ids") or ()), frozenset(data.get("hosts") or ())
+        running = frozenset(data.get("cluster_ids") or ())
+        return RunningSnapshot(
+            running=running,
+            covered=frozenset(data.get("hosts") or ()),
+            workloads=_parse_observed_workloads(data.get("workloads"), running),
+        )
     except Exception:
         return None
+
+
+def _parse_observed_workloads(raw, running: frozenset) -> "dict[str, ObservedWorkload]":
+    """Decode the ``workloads`` block, tolerating anything it may hold."""
+    if not isinstance(raw, dict):
+        return {}
+    observed: dict[str, ObservedWorkload] = {}
+    for cluster_id, entry in raw.items():
+        # Same guard as the write side, re-applied: the file is user-writable
+        # and may have been produced by another version.
+        if cluster_id not in running or not isinstance(entry, dict):
+            continue
+        hosts = entry.get("hosts")
+        observed[str(cluster_id)] = ObservedWorkload(
+            cluster_id=str(cluster_id),
+            recipe=entry.get("recipe") or None,
+            runtime=entry.get("runtime") or None,
+            hosts=tuple(str(h) for h in hosts) if isinstance(hosts, (list, tuple)) else (),
+        )
+    return observed
 
 
 #: Jobs older than this are candidates for pruning.

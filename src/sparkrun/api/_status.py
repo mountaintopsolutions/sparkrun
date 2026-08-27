@@ -89,13 +89,21 @@ def _record_running_snapshot(snapshot: "ClusterStatus", hosts: list[str], sctx) 
     Only *reachable* hosts are recorded as covered: a host in
     ``ClusterStatus.errors`` was not observed, and claiming otherwise would let
     a reader conclude "not running" about a workload nobody looked at.
+
+    The per-workload labels go with it.  ``query_status`` recovers recipe and
+    runtime from the container labels sparkrun emits, and they cost nothing to
+    carry — but without them a workload this machine has no job metadata for
+    completes to a bare hex digest, which is the one completion a human cannot
+    read.  A workload spanning several hosts is folded into one entry, in the
+    order the sweep visited them.
     """
     try:
-        from sparkrun.orchestration.job_metadata import save_running_snapshot
+        from sparkrun.orchestration.job_metadata import observe_workloads, save_running_snapshot
 
-        cluster_ids = {w.cluster_id for entry in snapshot.hosts for w in entry.workloads if w.cluster_id}
+        observed = observe_workloads(snapshot)
+        cluster_ids = {w.cluster_id for w in observed}
         covered = [h for h in hosts if h not in snapshot.errors]
-        save_running_snapshot(cluster_ids, covered, sctx=sctx)
+        save_running_snapshot(cluster_ids, covered, workloads=observed, sctx=sctx)
     except Exception:
         logger.debug("Could not record running snapshot", exc_info=True)
 

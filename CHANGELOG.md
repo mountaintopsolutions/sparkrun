@@ -99,6 +99,66 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
   error. sparkrun runs the server as the container foreground process, so there
   is no earlyoom supervisor to substitute.
 
+### Fixed
+
+- `sparkrun logs` no longer deletes a **running** workload's job metadata. The
+  log sources were named from the *caller's* host list rather than the
+  workload's own placement, so a solo job on one host of a multi-host cluster
+  was read as `{cid}_node_0` / `{cid}_head` instead of `{cid}_solo`. The
+  liveness precheck then found that container absent, `describe_terminated`
+  confirmed it had never existed, and the "confirmed gone → clean up stale
+  metadata" branch removed the entry for a deployment that was serving traffic.
+  Since the runtime is recorded only in that metadata, every subsequent
+  `sparkrun logs <cluster_id>` failed with "No job metadata (or no runtime
+  recorded)…" and `sparkrun status` lost the recipe label — with no way back
+  short of relaunching. Fixed in three places, each independently sufficient to
+  prevent the data loss:
+  - The sources are named from the workload's placement: the live status
+    snapshot when it shows a lone `_solo` container, else the hosts recorded at
+    launch (for the recipe form, where the caller named no hosts to read), else
+    the caller's list as before.
+  - A container name the snapshot does not report, on a host where the workload
+    *is* running, is now inconclusive rather than "confirmed absent" — it means
+    sparkrun named the container wrongly, not that the workload stopped.
+  - The metadata removal is gated on the whole snapshot: a cluster_id reported
+    running anywhere keeps its entry, whatever the precheck concluded about the
+    sources.
+- `sparkrun logs <cluster_id>` now falls back to the `sparkrun.runtime`
+  container label (surfaced by `query_status` as
+  `RunningWorkload.runtime_name`) when the job-metadata cache cannot name the
+  runtime. A live workload launched from another control machine — or one whose
+  cache entry was lost — is readable again instead of being unaddressable by id.
+  This also restores useful `logs`/`stop` tab completion for those workloads,
+  which is populated from the same cache.
+- `logs`/`stop` completion now describes a running workload that has no cached
+  job metadata, instead of offering a bare hex cluster_id. The status sweep
+  already recovers recipe and runtime from the `sparkrun.recipe` /
+  `sparkrun.runtime` container labels, so `running.json` carries them under a
+  new `workloads` key and completion renders `recipe runtime on host` as the
+  item's help — on zsh and fish, which display it; bash discards help text, so
+  the value still has to stand alone there. The key is additive and read
+  leniently: a snapshot written by an earlier sparkrun (or one whose
+  `workloads` block is unreadable) keeps its running set and simply has no
+  descriptions, because discarding the set over a missing annotation would put
+  every dead job back in the list. A recipe ref that is a path to a YAML file
+  is annotated by its stem: the ref records whatever the launch was handed, so
+  a job started from a laptop carries that laptop's absolute path, and the
+  directory layout is not what identifies the recipe. Bare names and
+  `@registry/name` refs are left alone — both are values a user can type, and
+  rewriting them in the annotation would misrepresent what to type.
+
+### Changed
+
+- `load_running_snapshot` returns a `RunningSnapshot` dataclass
+  (`running` / `covered` / `workloads`) rather than a
+  `(cluster_ids, hosts_covered)` tuple. Adding the third field to a tuple would
+  have silently broken every `running, covered = …` destructure, and two
+  positional frozensets are easy to transpose. `save_running_snapshot` grows a
+  keyword-only `workloads=` argument; its positional signature is unchanged.
+  New `ObservedWorkload` record and `observe_workloads()` fold, shared by
+  `api.status` and completion's own sweep so the two cannot describe the same
+  workload differently.
+
 ## [0.3.0] — 2026-07-30
 
 The largest release since 0.1: multiplatform foundations, a console-free
